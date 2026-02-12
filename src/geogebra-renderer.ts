@@ -481,6 +481,28 @@ export async function renderGeoGebra(
                     setTimeout(injectExportContent, saveDelay + 1000);
                     setTimeout(injectExportContent, saveDelay + 4000);
 
+                    // Auto-refresh cache when user interacts
+                    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+                    const debouncedRefresh = () => {
+                        if (refreshTimer) clearTimeout(refreshTimer);
+                        refreshTimer = setTimeout(injectExportContent, 600);
+                    };
+                    try {
+                        // Object changes (drag points, sliders, etc.)
+                        api.registerUpdateListener(debouncedRefresh);
+                    } catch { /* ignore */ }
+                    try {
+                        // View changes (pan, zoom, rotate, resize, etc.)
+                        // Trigger on most events except very high-frequency ones
+                        api.registerClientListener((evt: any) => {
+                            const t = evt?.type || evt;
+                            if (typeof t !== 'string') return;
+                            // Skip high-frequency mouse-move events
+                            if (/^(mouseDown|updateStyle|editorStart|editorKeyTyped|showStyleBar)$/i.test(t)) return;
+                            debouncedRefresh();
+                        });
+                    } catch { /* ignore */ }
+
                     resolve();
                 },
             };
@@ -616,6 +638,22 @@ function executeCommands(api: any, commands: string[]): void {
             }, 300);
         }
         console.log(`[GeoGebra] All ${commands.length} commands executed`);
+
+        // Auto-show function expressions as labels
+        // Label styles: 0=NAME, 1=NAME_VALUE, 2=VALUE, 3=CAPTION
+        try {
+            const allNames = api.getAllObjectNames() || [];
+            for (const name of allNames) {
+                const objType = api.getObjectType(name);
+                if (objType === 'function' || objType === 'line' && name.match(/^[a-z]$/)) {
+                    // Only for function objects (f, g, h, etc.)
+                    if (objType === 'function') {
+                        api.setLabelVisible(name, true);
+                        api.setLabelStyle(name, 1); // NAME_VALUE: "f(x) = sin(x)"
+                    }
+                }
+            }
+        } catch { /* ignore */ }
     } catch (e) {
         console.error('[GeoGebra] Error executing commands:', e);
     }

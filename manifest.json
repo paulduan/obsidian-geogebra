@@ -1,7 +1,7 @@
 {
   "id": "obsidian-geogebra",
   "name": "GeoGebra Renderer",
-  "version": "1.1.21",
+  "version": "1.1.25",
   "minAppVersion": "0.15.0",
   "description": "Render GeoGebra code blocks (2D geometry, 3D geometry, function graphs) with native GeoGebra API",
   "author": "duan",
