@@ -1,7 +1,7 @@
 {
   "name": "obsidian-geogebra",
   "version": "1.0.0",
-  "description": "Render GeoGebra commands in Obsidian using JSXGraph",
+  "description": "Render GeoGebra code blocks in Obsidian (2D, 3D, graphing) with full CSP bypass",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -11,8 +11,9 @@
   "keywords": [
     "obsidian",
     "geogebra",
-    "jsxgraph",
-    "geometry"
+    "geometry",
+    "math",
+    "3d"
   ],
   "license": "MIT",
   "devDependencies": {

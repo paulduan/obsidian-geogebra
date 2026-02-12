@@ -3,7 +3,7 @@
   "name": "GeoGebra Renderer",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
-  "description": "Render GeoGebra commands (2D geometry, 3D geometry, function graphs) using JSXGraph",
+  "description": "Render GeoGebra code blocks (2D geometry, 3D geometry, function graphs) with native GeoGebra API",
   "author": "duan",
   "isDesktopOnly": false
 }
