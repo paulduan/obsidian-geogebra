@@ -570,12 +570,25 @@ export function getGeoGebraVersion(): string | null {
  * Load the GeoGebra deployment script.
  * After this resolves, window.GGBApplet is available.
  */
-export async function loadGeoGebra(): Promise<void> {
-    if ((window as any).GGBApplet) {
-        console.log('[GeoGebra] GGBApplet already available');
-        return;
-    }
+/** Single loading promise to prevent concurrent loads from multiple code blocks */
+let loadingPromise: Promise<void> | null = null;
 
+export function loadGeoGebra(): Promise<void> {
+    if ((window as any).GGBApplet) {
+        return Promise.resolve();
+    }
+    // If already loading, return the same promise
+    if (loadingPromise) return loadingPromise;
+
+    loadingPromise = doLoadGeoGebra().catch(e => {
+        // Reset on failure so next attempt can retry
+        loadingPromise = null;
+        throw e;
+    });
+    return loadingPromise;
+}
+
+async function doLoadGeoGebra(): Promise<void> {
     installInterceptor();
 
     const deployUrl = 'https://www.geogebra.org/apps/deployggb.js';

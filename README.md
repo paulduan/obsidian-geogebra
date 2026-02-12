@@ -106,6 +106,10 @@ Line(A, B)
 | `@toolbar` | 显示工具栏 | `false` | `@toolbar true` |
 | `@grid` | 显示网格 | GeoGebra 默认 | `@grid true` |
 | `@axes` | 显示坐标轴 | GeoGebra 默认 | `@axes true` |
+| `@keyboard` | 显示左下角虚拟键盘按钮 | `true` | `@keyboard false` |
+| `@center` | 视图中心点坐标 | 自动 | 2D: `@center 3,5`　3D: `@center 0,0,6` |
+| `@zoom` | 视野范围（从中心到边界的单位数） | `15` | `@zoom 20` |
+| `@range` | 坐标系精确范围 | 自动 | `@range -10,10,-5,5` |
 
 #### 视图布局（perspective）说明
 
@@ -121,6 +125,59 @@ Line(A, B)
 - `G` — 仅平面图形（无代数面板）
 - `AT` — 代数面板 + 3D 视图
 - `AGT` — 代数面板 + 平面图形 + 3D 视图
+
+#### 视图控制（center / zoom / range）
+
+通过 `@center`、`@zoom`、`@range` 控制视图的初始位置和缩放。
+
+**`@center`** — 设置视图中心点：
+
+- 2D 模式：`@center x,y`，例如 `@center 3,5`
+- 3D 模式：`@center x,y,z`，例如 `@center 0,0,6`
+
+**`@zoom`** — 设置视野范围（从中心到边界的单位数），通常与 `@center` 搭配使用：
+
+- 默认值 `15`，即中心向各方向可见 15 个单位
+- `@zoom 5` 表示放大视图，`@zoom 50` 表示缩小视图
+
+**`@range`** — 精确指定坐标系范围（优先级高于 center/zoom）：
+
+- 格式：`@range xMin,xMax,yMin,yMax`
+- 3D 模式下 zMin/zMax 自动取 xMin/xMax 的值
+
+**示例：2D 指定视图中心和缩放**
+
+````markdown
+```geogebra
+@center 3,5
+@zoom 10
+@grid true
+A = (1, 3)
+B = (5, 7)
+Segment(A, B)
+```
+````
+
+**示例：3D 指定视图中心**
+
+````markdown
+```geogebra-3d
+@center 0,0,6
+@zoom 15
+A = (0, 0, 0)
+B = (0, 0, 12)
+cyl = Cylinder(A, B, 2)
+```
+````
+
+**示例：精确指定坐标范围**
+
+````markdown
+```geogebra
+@range -5,15,-2,12
+f(x) = x^2 / 10
+```
+````
 
 ### 动画示例
 
@@ -166,6 +223,7 @@ obsidian-geogebra-plugin/
 ├── styles.css               # 插件样式
 ├── manifest.json            # Obsidian 插件清单
 ├── esbuild.config.mjs       # 构建配置
+├── version-bump.mjs         # 自动递增 patch 版本号
 ├── deploy.mjs               # 部署脚本（复制到 vault）
 ├── package.json
 └── tsconfig.json
@@ -183,13 +241,21 @@ npm run dev
 # 生产构建
 npm run build
 
-# 构建并部署到 vault（需修改 deploy.mjs 中的路径）
+# 构建并部署到 vault（自动递增版本号，需修改 deploy.mjs 中的路径）
 npm run deploy
+
+# 仅递增版本号（不构建不部署）
+npm run version-bump
 ```
 
 ### 部署脚本
 
-`deploy.mjs` 默认将构建产物复制到指定的 Obsidian vault 目录。首次使用前需修改其中的 `VAULT_PLUGIN_DIR` 路径为你自己的 vault 位置：
+`npm run deploy` 会依次执行：
+1. **`version-bump.mjs`** — 自动递增 patch 版本号（如 `1.1.1` → `1.1.2`），同时更新 `manifest.json` 和 `package.json`
+2. **`npm run build`** — 编译 TypeScript
+3. **`deploy.mjs`** — 复制构建产物到 Obsidian vault
+
+首次使用前需修改 `deploy.mjs` 中的 `VAULT_PLUGIN_DIR` 路径为你自己的 vault 位置：
 
 ```javascript
 const VAULT_PLUGIN_DIR = join(

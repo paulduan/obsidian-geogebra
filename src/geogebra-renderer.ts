@@ -54,6 +54,14 @@ export interface AppletParams {
     toolbar?: boolean;
     grid?: boolean;
     axes?: boolean;
+    /** Hide the virtual keyboard button at bottom-left */
+    keyboard?: boolean;
+    /** Coordinate system bounds: [xMin, xMax, yMin, yMax] */
+    range?: [number, number, number, number];
+    /** Center point of the view: [x, y] for 2D or [x, y, z] for 3D */
+    center?: number[];
+    /** Zoom level (visible units from center): used with @center */
+    zoom?: number;
 }
 
 function parseSource(source: string): { params: AppletParams; commands: string[] } {
@@ -88,6 +96,29 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
                 case 'axes':
                     params.axes = val.toLowerCase() === 'true' || val === '1';
                     break;
+                case 'keyboard':
+                    params.keyboard = val.toLowerCase() === 'true' || val === '1';
+                    break;
+                case 'center': {
+                    // @center x,y  or  @center x,y,z  for 3D
+                    const parts = val.split(/[,\s]+/).map(Number);
+                    if (parts.length >= 2 && parts.every(n => !isNaN(n))) {
+                        params.center = parts.slice(0, parts.length >= 3 ? 3 : 2);
+                    }
+                    break;
+                }
+                case 'zoom':
+                    // @zoom 10  — visible units from center in each direction
+                    params.zoom = parseFloat(val);
+                    break;
+                case 'range': {
+                    // @range xMin,xMax,yMin,yMax  e.g. @range -10,10,-5,5
+                    const r = val.split(/[,\s]+/).map(Number);
+                    if (r.length >= 4 && r.every(n => !isNaN(n))) {
+                        params.range = [r[0], r[1], r[2], r[3]];
+                    }
+                    break;
+                }
             }
             continue;
         }
@@ -172,7 +203,8 @@ export async function renderGeoGebra(
                 height,
                 perspective,
                 scaleContainerClass: 'ggb-applet-container',
-                showAlgebraInput: true,
+                showAlgebraInput: userParams.keyboard ?? true,
+                showKeyboardOnFocus: userParams.keyboard ?? true,
                 algebraInputPosition: 'algebra',
                 showToolBar,
                 showToolBarHelp: false,
@@ -203,31 +235,75 @@ export async function renderGeoGebra(
 
                     executeCommands(api, commands);
 
-                    // Auto-center the view after commands are executed
+                    // Apply coordinate system settings after commands
+                    // 3D needs longer delay for the 3D view to fully initialize
+                    const viewDelay = mode === RenderMode.Geometry3D ? 800 : 300;
+                    const apply3DView = (api: any, cx: number, cy: number, cz: number, z: number) => {
+                        api.evalCommand('SetActiveView(2)');
+                        const cmd = `SetCoordSystem(${cx - z}, ${cx + z}, ${cy - z}, ${cy + z}, ${cz - z}, ${cz + z})`;
+                        api.evalCommand(cmd);
+                        console.log(`[GeoGebra] 3D SetCoordSystem: ${cmd}`);
+                        // Also try JS API as fallback
+                        try {
+                            api.setCoordSystem(cx - z, cx + z, cy - z, cy + z, cz - z, cz + z);
+                        } catch (_) { /* ignore */ }
+                    };
                     setTimeout(() => {
                         try {
                             if (mode === RenderMode.Geometry3D) {
-                                // For 3D view: reset rotation and zoom to show
-                                // all objects. View ID 512 = 3D Graphics View
-                                api.evalCommand('SetActiveView(2)');
-                                // CenterView resets the 3D camera position
-                                try { api.evalCommand('CenterView((0,0,0))'); } catch {}
+                                // ── 3D view adjustment ──
+                                if (userParams.center || userParams.zoom) {
+                                    const cx = userParams.center?.[0] ?? 0;
+                                    const cy = userParams.center?.[1] ?? 0;
+                                    const cz = userParams.center?.[2] ?? 0;
+                                    const z = userParams.zoom || 15;
+                                    apply3DView(api, cx, cy, cz, z);
+                                    // Retry after another delay to ensure 3D view is ready
+                                    setTimeout(() => {
+                                        try { apply3DView(api, cx, cy, cz, z); } catch (_) {}
+                                    }, 1000);
+                                } else if (userParams.range) {
+                                    api.evalCommand('SetActiveView(2)');
+                                    const [x0, x1, y0, y1] = userParams.range;
+                                    api.evalCommand(`SetCoordSystem(${x0}, ${x1}, ${y0}, ${y1}, ${x0}, ${x1})`);
+                                    console.log(`[GeoGebra] 3D range set from @range`);
+                                } else {
+                                    // Auto-fit
+                                    api.evalCommand('SetActiveView(2)');
+                                    try {
+                                        api.evalCommand('SelectAll()');
+                                        api.evalCommand('ZoomToFit()');
+                                        api.evalCommand('SelectAll()');
+                                    } catch {}
+                                }
+                            } else if (userParams.range) {
+                                // ── 2D explicit range ──
+                                const [xMin, xMax, yMin, yMax] = userParams.range;
+                                api.setCoordSystem(xMin, xMax, yMin, yMax);
+                                console.log(`[GeoGebra] 2D range: [${xMin}, ${xMax}, ${yMin}, ${yMax}]`);
+                            } else if (userParams.center) {
+                                // ── 2D center + zoom ──
+                                const [cx, cy] = userParams.center;
+                                const z = userParams.zoom || 10;
+                                api.setCoordSystem(cx - z, cx + z, cy - z, cy + z);
+                                console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z}`);
+                            } else {
+                                // ── Auto-fit ──
+                                try {
+                                    api.evalCommand('SelectAll()');
+                                    api.evalCommand('ZoomToFit()');
+                                    api.evalCommand('SelectAll()');
+                                } catch {}
                             }
-                            // SelectAll + ZoomToFit approach
-                            try {
-                                api.evalCommand('SelectAll()');
-                                api.evalCommand('ZoomToFit()');
-                                api.evalCommand('SelectAll()'); // deselect
-                            } catch {
-                                // ZoomToFit may not exist in all versions
-                            }
-                            console.log(`[GeoGebra] Auto-center applied`);
+                            console.log(`[GeoGebra] View adjustment applied`);
                         } catch (e) {
-                            console.warn('[GeoGebra] Auto-center failed:', e);
+                            console.warn('[GeoGebra] View adjustment failed:', e);
                         }
-                    }, 300);
+                    }, viewDelay);
 
                     // Save initial state for reset (after auto-center settles)
+                    // For 3D with center/zoom, wait longer due to retry
+                    const saveDelay = (mode === RenderMode.Geometry3D && (userParams.center || userParams.zoom)) ? 2500 : 800;
                     setTimeout(() => {
                         try {
                             const savedState = api.getBase64();
@@ -241,7 +317,7 @@ export async function renderGeoGebra(
                         } catch (e) {
                             console.warn('[GeoGebra] Could not save initial state:', e);
                         }
-                    }, 800);
+                    }, saveDelay);
 
                     resolve();
                 },
