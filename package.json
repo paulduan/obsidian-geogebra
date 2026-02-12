@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-geogebra",
+  "version": "1.0.0",
+  "description": "Render GeoGebra commands in Obsidian using JSXGraph",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "deploy": "npm run build && node deploy.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "geogebra",
+    "jsxgraph",
+    "geometry"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+  }
+}

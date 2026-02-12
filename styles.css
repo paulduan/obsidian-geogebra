@@ -1,0 +1,162 @@
+/* ─── GeoGebra Plugin Styles ─── */
+
+.geogebra-container {
+    margin: 1em 0;
+    padding: 0;
+    background-color: var(--background-secondary);
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--background-modifier-border);
+    /* Full width of the content area */
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* ─── Header with mode badge + reset ─── */
+
+.ggb-header {
+    display: flex;
+    align-items: center;
+    padding: 6px 12px;
+    background-color: var(--background-secondary-alt);
+    border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.ggb-mode-badge {
+    font-size: 0.75em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border-radius: 4px;
+    color: var(--text-on-accent);
+}
+
+.geogebra-mode-2d .ggb-mode-badge {
+    background-color: #2196F3;
+}
+
+.geogebra-mode-3d .ggb-mode-badge {
+    background-color: #9C27B0;
+}
+
+.geogebra-mode-graph .ggb-mode-badge {
+    background-color: #4CAF50;
+}
+
+.ggb-header-spacer {
+    flex: 1;
+}
+
+/* ─── Button group ─── */
+
+.ggb-btn-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ggb-header-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.78em;
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--background-modifier-border);
+    background-color: var(--background-primary);
+    color: var(--text-normal);
+    cursor: pointer;
+    transition: background-color 0.15s, opacity 0.15s, border-color 0.15s;
+    white-space: nowrap;
+}
+
+.ggb-header-btn:hover:not([disabled]) {
+    background-color: var(--background-modifier-hover);
+}
+
+.ggb-header-btn[disabled] {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.ggb-btn-icon {
+    font-size: 1.1em;
+    line-height: 1;
+}
+
+/* Active state for toggle button (algebra panel visible) */
+.ggb-toggle-algebra-btn.ggb-btn-active {
+    border-color: var(--interactive-accent);
+    color: var(--interactive-accent);
+}
+
+.ggb-toggle-algebra-btn:not(.ggb-btn-active) {
+    opacity: 0.7;
+}
+
+/* ─── Applet container ─── */
+
+.ggb-applet-container {
+    width: 100% !important;
+    min-height: 400px;
+    position: relative;
+    background-color: white;
+    overflow: hidden;
+    box-sizing: border-box;
+}
+
+.theme-dark .ggb-applet-container {
+    background-color: #2a2a2a;
+}
+
+/* Force GeoGebra applet elements to fill width */
+.ggb-applet-container > div,
+.ggb-applet-container > article {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.ggb-applet-container .GeoGebraFrame {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+/* ─── Loading state ─── */
+
+.ggb-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2em;
+    color: var(--text-muted);
+    font-size: 0.9em;
+    gap: 8px;
+}
+
+.ggb-loading::before {
+    content: '';
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--text-faint);
+    border-top-color: var(--interactive-accent);
+    border-radius: 50%;
+    animation: ggb-spin 0.8s linear infinite;
+}
+
+@keyframes ggb-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ─── Error display ─── */
+
+.geogebra-error {
+    color: var(--text-error);
+    padding: 1em;
+    background-color: var(--background-modifier-error);
+    border-radius: 4px;
+    border-left: 4px solid var(--text-error);
+    font-size: 0.9em;
+    line-height: 1.6;
+    margin: 0.5em;
+}

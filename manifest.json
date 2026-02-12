@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-geogebra",
+  "name": "GeoGebra Renderer",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Render GeoGebra commands (2D geometry, 3D geometry, function graphs) using JSXGraph",
+  "author": "duan",
+  "isDesktopOnly": false
+}
