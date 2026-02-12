@@ -9,6 +9,8 @@
 - **动画支持**：通过 `SetAnimating` / `StartAnimation` 驱动点动画
 - **自定义参数**：通过 `@key value` 控制画布大小、视图布局等
 - **重置按钮**：一键恢复到初始状态（而非清空画布）
+- **导出 PNG**：点击 Export 按钮下载当前图形为 PNG 图片
+- **PDF 导出支持**：Obsidian 导出 PDF 时自动将动态图形替换为静态截图
 - **完整 CSP 绕过**：自动处理 Obsidian 的内容安全策略限制
 
 ## 安装
@@ -208,6 +210,23 @@ StartAnimation()
 | `SetPointSize(name, size)` | 设置点大小 |
 | `SetCaption(name, "text")` | 设置标签 |
 | `SetLabelVisible(name, true/false)` | 显示/隐藏标签 |
+
+### 导出与 PDF
+
+#### 导出 PNG
+
+每个 GeoGebra 代码块的标题栏都有一个 **Export** 按钮，点击后会以 PNG 格式（2x 缩放、300 DPI）下载当前图形。
+
+#### PDF 导出
+
+通过 Obsidian 的 **文件 → 导出为 PDF** 功能导出时，插件会自动将动态 GeoGebra 图形替换为静态截图（在 applet 加载完成后自动捕获）。
+
+工作原理：
+- Applet 初始化完成后自动截取一张 PNG 快照，存储为隐藏的 `<img>` 元素
+- CSS `@media print` 规则在打印/导出时隐藏动态 applet，显示静态图片
+- 导出的 PDF 中会包含图形的完整截图
+
+> **注意**：PDF 中的图形为截图时刻的静态快照。如果之后通过滑块或拖拽改变了图形，PDF 中仍为初始状态的截图。
 
 ## 开发
 

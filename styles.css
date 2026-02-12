@@ -148,6 +148,83 @@
     to { transform: rotate(360deg); }
 }
 
+/* ─── PDF Export (inline SVG / img) ─── */
+
+/*
+ * Export container: hidden by default on screen.
+ * Made visible via .ggb-export-active class (set by JS when applet fails
+ * and cached content is available — i.e. during PDF re-render).
+ */
+.ggb-export-container {
+    display: none;
+    width: 100%;
+    background: white;
+    page-break-inside: avoid;
+}
+
+.theme-dark .ggb-export-container {
+    background: #2a2a2a;
+}
+
+.ggb-export-container.ggb-export-active {
+    display: block !important;
+}
+
+/* Cache-only mode: strip all decorations, show only the image */
+.geogebra-container.ggb-cache-only {
+    border: none !important;
+    border-radius: 0 !important;
+    background: none !important;
+    padding: 0 !important;
+    margin: 0.5em 0 !important;
+}
+
+.geogebra-container.ggb-cache-only .ggb-header {
+    display: none !important;
+}
+
+.geogebra-container.ggb-cache-only .ggb-loading {
+    display: none !important;
+}
+
+.ggb-export-container svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.ggb-export-container .ggb-export-img {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+/* ─── Print / PDF: strip decorations, only show the image ─── */
+
+@media print {
+    .geogebra-container {
+        border: none !important;
+        border-radius: 0 !important;
+        background: none !important;
+        padding: 0 !important;
+        margin: 0.5em 0 !important;
+        box-shadow: none !important;
+    }
+    .ggb-header {
+        display: none !important;
+    }
+    .ggb-applet-container {
+        display: none !important;
+    }
+    .ggb-loading {
+        display: none !important;
+    }
+    .ggb-export-container:not(:empty) {
+        display: block !important;
+        background: none !important;
+    }
+}
+
 /* ─── Error display ─── */
 
 .geogebra-error {

@@ -91,9 +91,10 @@ function resolveMisroutedUrl(url: string): string | null {
         return cdnBase + cleanPath;
     }
 
-    // GeoGebra JS resources (at app version root)
+    // GeoGebra JS resources — some live under web3d/, some under app root
+    // canvas-to-svg, etc. are under web3d/js/
     if (cleanPath.startsWith('js/') && cleanPath.endsWith('.js')) {
-        return appBase + cleanPath;
+        return cdnBase + cleanPath;
     }
 
     // GeoGebra HTML resources
@@ -105,11 +106,28 @@ function resolveMisroutedUrl(url: string): string | null {
 }
 
 /**
+ * Fix GeoGebra CDN URLs where resources are under the wrong subdirectory.
+ * e.g. apps/{version}/js/foo.js → apps/{version}/web3d/js/foo.js
+ */
+function fixGeoGebraPath(url: string): string {
+    if (!ggbVersion) return url;
+    const versionPath = `/apps/${ggbVersion}/`;
+    const web3dPath = `/apps/${ggbVersion}/web3d/`;
+    // js/ resources that are NOT already under web3d/
+    if (url.includes(versionPath + 'js/') && !url.includes(web3dPath + 'js/')) {
+        const fixed = url.replace(versionPath + 'js/', web3dPath + 'js/');
+        console.log(`[GeoGebra] Fixed path: ${url.split('/').pop()} → web3d/js/`);
+        return fixed;
+    }
+    return url;
+}
+
+/**
  * Check if a URL needs interception (GeoGebra CDN or misrouted GWT fragment).
  * Returns the correct CDN URL to fetch, or null if no interception needed.
  */
 function getInterceptUrl(url: string): string | null {
-    if (isGeoGebraUrl(url)) return url;
+    if (isGeoGebraUrl(url)) return fixGeoGebraPath(url);
     return resolveMisroutedUrl(url);
 }
 
@@ -555,6 +573,8 @@ export function removeInterceptor(): void {
         Object.defineProperty(HTMLScriptElement.prototype, 'src', origScriptSrcDescriptor);
     }
     interceptorInstalled = false;
+    // Reset loading state so next plugin load starts fresh
+    loadingPromise = null;
     console.log('[GeoGebra] All interceptors removed');
 }
 

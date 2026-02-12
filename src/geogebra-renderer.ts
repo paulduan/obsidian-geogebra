@@ -6,8 +6,77 @@
  */
 import { loadGeoGebra, getGeoGebraVersion } from './geogebra-loader';
 import { RenderMode } from './types';
+import type { Vault } from 'obsidian';
 
 declare const GGBApplet: any;
+
+// ─── File-based cache for PDF export ───
+let cacheVault: Vault | null = null;
+let cacheDirPath = '.obsidian/plugins/obsidian-geogebra/cache';
+
+/** Called from main.ts to set vault reference and cache directory */
+export function setCacheDir(vault: Vault, dir: string): void {
+    cacheVault = vault;
+    cacheDirPath = dir;
+}
+
+function makeCacheKey(mode: RenderMode, source: string): string {
+    let hash = 0;
+    const str = mode + ':' + source.trim();
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return 'ggb_' + Math.abs(hash).toString(36);
+}
+
+function cachePath(key: string): string {
+    return `${cacheDirPath}/${key}.html`;
+}
+
+async function cacheGet(key: string): Promise<string | null> {
+    // Try file cache first
+    if (cacheVault) {
+        try {
+            const path = cachePath(key);
+            const file = cacheVault.getFileByPath(path);
+            if (file) return await cacheVault.read(file);
+        } catch { /* ignore */ }
+    }
+    // Fallback to localStorage (works even in PDF export context)
+    try { return localStorage.getItem('ggb_' + key); } catch { return null; }
+}
+
+async function cacheSet(key: string, value: string): Promise<void> {
+    // Write to file
+    if (cacheVault) {
+        try {
+            const path = cachePath(key);
+            // Ensure directory exists
+            const dir = path.substring(0, path.lastIndexOf('/'));
+            if (!cacheVault.getAbstractFileByPath(dir)) {
+                try { await cacheVault.createFolder(dir); } catch { /* already exists */ }
+            }
+            try {
+                const existing = cacheVault.getFileByPath(path);
+                if (existing) {
+                    await cacheVault.modify(existing, value);
+                } else {
+                    await cacheVault.create(path, value);
+                }
+            } catch {
+                // Race: file created between check and create — try modify
+                try {
+                    const f = cacheVault.getFileByPath(path);
+                    if (f) await cacheVault.modify(f, value);
+                } catch { /* ignore */ }
+            }
+        } catch (e) {
+            console.warn('[GeoGebra] File cache write failed:', e);
+        }
+    }
+    // Also save to localStorage as fallback
+    try { localStorage.setItem('ggb_' + key, value); } catch { /* ignore */ }
+}
 
 /** Map RenderMode to GeoGebra app name */
 const APP_NAMES: Record<RenderMode, string> = {
@@ -132,19 +201,46 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
 /**
  * Render a GeoGebra code block into the given container.
  */
+export interface AppletCallbacks {
+    onResetReady?: (resetFn: () => void) => void;
+}
+
 export async function renderGeoGebra(
     container: HTMLElement,
     source: string,
     mode: RenderMode,
-    onResetReady?: (resetFn: () => void) => void
+    callbacks?: AppletCallbacks
 ): Promise<void> {
+    const { onResetReady } = callbacks || {};
+    const ck = makeCacheKey(mode, source);
+
+    // Static export container for PDF export (inline SVG / img)
+    // Created FIRST so cached content appears immediately
+    const exportDiv = container.createDiv({ cls: 'ggb-export-container' });
+
+    // Check cache — if we have a previous render, inject immediately.
+    // This is critical for Obsidian's PDF export which re-renders markdown
+    // and won't wait for GeoGebra to load from CDN.
+    let hasCachedContent = false;
+    const cached = await cacheGet(ck);
+    if (cached) {
+        exportDiv.innerHTML = cached;
+        exportDiv.classList.add('ggb-export-active');
+        hasCachedContent = true;
+        console.log(`[GeoGebra] Cache hit: ${ck} (${cached.length} chars)`);
+    }
+
     const appletId = `ggb-applet-${Date.now()}-${++appletCounter}`;
     const appletDiv = container.createDiv({ cls: 'ggb-applet-container' });
     appletDiv.id = appletId;
 
-    // Show loading state
+    // Show loading state — but hide it if we already have cached content
+    // (during PDF export, we don't want "Loading..." to appear)
     const loadingEl = container.createDiv({ cls: 'ggb-loading' });
     loadingEl.setText('Loading GeoGebra...');
+    if (hasCachedContent) {
+        loadingEl.style.display = 'none';
+    }
 
     // Parse parameters and commands from source
     const { params: userParams, commands } = parseSource(source);
@@ -186,12 +282,20 @@ export async function renderGeoGebra(
         console.log(`[GeoGebra] Measured container width: ${measuredWidth}px → using ${width}x${height}`);
 
         await new Promise<void>((resolve, reject) => {
+            // Shorter timeout when cache is available (just for live upgrade attempt)
+            const timeoutMs = hasCachedContent ? 15000 : 60000;
             const timeout = setTimeout(() => {
-                const errMsg = errorCapture.length > 0
-                    ? `GeoGebra errors:\n${errorCapture.join('\n')}`
-                    : 'GeoGebra applet initialization timed out (60s). Check console for details.';
-                reject(new Error(errMsg));
-            }, 60000);
+                if (hasCachedContent) {
+                    // Cache available — silently give up on live applet
+                    console.log(`[GeoGebra] Live applet timed out but cache available, using cached content`);
+                    resolve();
+                } else {
+                    const errMsg = errorCapture.length > 0
+                        ? `GeoGebra errors:\n${errorCapture.join('\n')}`
+                        : 'GeoGebra applet initialization timed out (60s). Check console for details.';
+                    reject(new Error(errMsg));
+                }
+            }, timeoutMs);
 
             const perspective = userParams.perspective || DEFAULT_PERSPECTIVES[mode];
             const showToolBar = userParams.toolbar ?? false;
@@ -224,6 +328,10 @@ export async function renderGeoGebra(
                     window.removeEventListener('error', errorHandler);
                     console.log(`[GeoGebra] Applet ${appletId} ready, executing ${commands.length} commands...`);
                     loadingEl.remove();
+
+                    // Live applet loaded — hide cached export, show applet
+                    exportDiv.classList.remove('ggb-export-active');
+                    appletDiv.style.display = '';
 
                     // Apply grid/axes settings before commands
                     if (userParams.grid !== undefined) {
@@ -319,6 +427,60 @@ export async function renderGeoGebra(
                         }
                     }, saveDelay);
 
+                    // ── Export static snapshot for PDF (inline SVG / PNG) ──
+                    const saveExportToCache = () => {
+                        if (exportDiv.innerHTML.length > 100) {
+                            cacheSet(ck, exportDiv.innerHTML);
+                        }
+                    };
+
+                    const injectExportContent = () => {
+                        if (mode !== RenderMode.Geometry3D) {
+                            try {
+                                api.exportSVG((svg: string) => {
+                                    if (svg && svg.length > 100) {
+                                        exportDiv.innerHTML = svg
+                                            .replace(/rgb\(0%, 0%, 0%\)/g, 'currentColor')
+                                            .replace(/#000000/g, 'currentColor');
+                                        saveExportToCache();
+                                        console.log(`[GeoGebra] SVG export cached (${svg.length} chars)`);
+                                    } else {
+                                        injectPNGFallback();
+                                    }
+                                });
+                            } catch {
+                                injectPNGFallback();
+                            }
+                        } else {
+                            injectPNGFallback();
+                        }
+                    };
+
+                    const injectPNGFallback = () => {
+                        try {
+                            const b64 = api.getPNGBase64(1, false, 72);
+                            if (b64 && b64.length > 100) {
+                                exportDiv.innerHTML = `<img src="data:image/png;base64,${b64}" class="ggb-export-img" alt="GeoGebra ${mode}">`;
+                                saveExportToCache();
+                                console.log(`[GeoGebra] PNG export cached`);
+                                return;
+                            }
+                        } catch { /* ignore */ }
+                        try {
+                            api.getScreenshotBase64((b64: string) => {
+                                if (b64 && b64.length > 100) {
+                                    exportDiv.innerHTML = `<img src="data:image/png;base64,${b64}" class="ggb-export-img" alt="GeoGebra ${mode}">`;
+                                    saveExportToCache();
+                                    console.log(`[GeoGebra] Screenshot export cached`);
+                                }
+                            });
+                        } catch { /* ignore */ }
+                    };
+
+                    // Inject after view adjustments settle
+                    setTimeout(injectExportContent, saveDelay + 1000);
+                    setTimeout(injectExportContent, saveDelay + 4000);
+
                     resolve();
                 },
             };
@@ -348,11 +510,22 @@ export async function renderGeoGebra(
         window.removeEventListener('error', errorHandler);
         loadingEl.remove();
         console.error('[GeoGebra] Render failed:', e);
-        const msg = (e as Error).message || String(e);
-        container.createDiv({
-            cls: 'geogebra-error',
-            text: `Failed to render GeoGebra: ${msg}`,
-        });
+
+        // If we have cached export content, show it instead of error
+        // (this happens during Obsidian's PDF export re-render)
+        if (exportDiv.innerHTML.length > 100) {
+            console.log(`[GeoGebra] Render failed but cache available — showing cached content`);
+            appletDiv.style.display = 'none';
+            exportDiv.classList.add('ggb-export-active');
+            // Strip container decorations for clean PDF output
+            container.classList.add('ggb-cache-only');
+        } else {
+            const msg = (e as Error).message || String(e);
+            container.createDiv({
+                cls: 'geogebra-error',
+                text: `Failed to render GeoGebra: ${msg}`,
+            });
+        }
     }
 }
 
