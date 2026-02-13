@@ -63,7 +63,6 @@
 
 .ggb-applet-container {
     width: 100% !important;
-    min-height: 400px;
     position: relative;
     background-color: white;
     overflow: hidden;

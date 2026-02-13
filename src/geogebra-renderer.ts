@@ -360,36 +360,55 @@ export async function renderGeoGebra(
 
         // ── 步骤 5：计算尺寸和缩放 ──
 
-        // 测量容器实际宽度，取 appletDiv 或 container 中较大的值，最小 400px
-        const measuredWidth = appletDiv.clientWidth || appletDiv.offsetWidth
-            || container.clientWidth || container.offsetWidth || 800;
+        // 测量容器实际宽度：从 appletDiv 开始向上遍历 DOM 树，
+        // 找到第一个有实际宽度的元素。新创建的 div 可能还没有布局宽度，
+        // 需要回退到父元素（Obsidian 的内容区域通常有明确宽度）。
+        let measuredWidth = 0;
+        let measureEl: HTMLElement | null = appletDiv;
+        while (measureEl && measuredWidth < 100) {
+            measuredWidth = measureEl.clientWidth || measureEl.offsetWidth || 0;
+            measureEl = measureEl.parentElement;
+        }
+        if (measuredWidth < 100) measuredWidth = 800; // 最终兜底
         const scale = userParams.scale || 1;
 
-        // GeoGebra 按原始尺寸渲染，缩放通过 CSS transform 实现
-        const width = userParams.width || Math.max(measuredWidth, 400);
+        // GeoGebra 内部按 width/height 参数布局，然后通过 scaleContainerClass 缩放到容器宽度。
+        // 3D 模式需要足够的内部宽度（≥1400px）才能让代数面板和 3D 视图并排显示。
+        const width = userParams.width || Math.max(measuredWidth, mode === RenderMode.Geometry3D ? 1400 : 0);
         const height = userParams.height || DEFAULT_HEIGHTS[mode];
-        // 缩放后的视觉尺寸
-        const visualWidth = Math.round(width * scale);
-        const visualHeight = Math.round(height * scale);
 
-        // 如果需要缩放，立即限制容器尺寸（防止溢出）
-        // CSS transform 会在 applet 加载后应用
-        if (scale !== 1) {
-            container.style.maxWidth = `${visualWidth}px`;
-            container.style.height = `${visualHeight}px`;
-            container.style.overflow = 'hidden';
-        } else if (userParams.height) {
-            appletDiv.style.minHeight = `${userParams.height}px`;
-        }
+        // GeoGebra scaleContainerClass 产生的缩放比（内部宽度 > 容器时自动缩放）
+        const ggbScale = (width > measuredWidth && measuredWidth > 0) ? measuredWidth / width : 1;
+        // GeoGebra 缩放后的视觉高度
+        const ggbVisualHeight = Math.round(height * ggbScale);
+        // @scale 应用后的最终视觉尺寸（用于 PNG 导出、容器限制等）
+        const visualWidth = Math.round(measuredWidth * scale);
+        const visualHeight = Math.round(ggbVisualHeight * scale);
 
-        // 延迟应用 CSS transform（避免在 PDF 导出的缓存路径中污染 DOM）
-        const applyScale = () => {
+        /**
+         * applet 加载后统一应用尺寸调整。
+         *
+         * @scale 的实现：在 appletDiv 上叠加 CSS transform。
+         * GeoGebra 的 scaleContainerClass 作用于 appletDiv 内部的 GeoGebraFrame，
+         * 我们的 transform 作用于 appletDiv 本身，两者在不同的 DOM 层级，不会冲突。
+         *
+         * 流程：GeoGebra 内部渲染 → scaleContainerClass 缩放到容器宽度 → CSS transform 再缩放
+         */
+        const applyAllSizing = () => {
+            // 修正 GeoGebra scaleContainerClass 缩放后的容器高度
+            if (ggbScale < 1) {
+                appletDiv.style.height = `${ggbVisualHeight}px`;
+            }
+            // 在 GeoGebra 缩放之上叠加用户的 @scale
             if (scale !== 1) {
                 appletDiv.style.transformOrigin = 'top left';
                 appletDiv.style.transform = `scale(${scale})`;
-                appletDiv.style.width = `${width}px`;
-                appletDiv.style.height = `${height}px`;
+                // transform 不影响布局尺寸，需要限制外层容器
+                container.style.width = `${visualWidth}px`;
+                container.style.height = `${visualHeight}px`;
+                container.style.overflow = 'hidden';
             }
+            console.log(`[GeoGebra] Sizing: internal ${width}x${height}, ggbScale=${ggbScale.toFixed(2)}, userScale=${scale}, visual ${visualWidth}x${visualHeight}`);
         };
 
         console.log(`[GeoGebra] Size: render ${width}x${height}, scale ${scale}, visual ${visualWidth}x${visualHeight}`);
@@ -461,7 +480,7 @@ export async function renderGeoGebra(
                     // 实时 applet 已加载 → 隐藏缓存导出容器，显示 applet
                     exportDiv.classList.remove('ggb-export-active');
                     appletDiv.style.display = '';
-                    applyScale();
+                    applyAllSizing();
 
                     // 在执行命令之前应用网格/坐标轴设置
                     if (userParams.grid !== undefined) {
@@ -473,6 +492,30 @@ export async function renderGeoGebra(
 
                     // 执行所有 GeoGebra 命令
                     executeCommands(api, commands);
+
+                    // 3D 模式下默认线条较粗，自动调细（除非用户已通过 SetLineThickness 自定义）
+                    if (mode === RenderMode.Geometry3D) {
+                        try {
+                            // 收集用户已手动设置线粗的对象名
+                            const userThicknessNames = new Set(
+                                commands
+                                    .filter(c => /^SetLineThickness\s*\(/i.test(c))
+                                    .map(c => c.match(/\(\s*(\w+)/)?.[1])
+                                    .filter(Boolean)
+                            );
+                            const allNames = api.getAllObjectNames() || [];
+                            for (const name of allNames) {
+                                if (userThicknessNames.has(name)) continue; // 用户已自定义，跳过
+                                const objType = api.getObjectType(name);
+                                // 对线条类对象（线、线段、射线、圆、圆锥曲线、曲面边等）设置细线
+                                if (['line', 'segment', 'ray', 'vector', 'conic', 'polygon',
+                                     'polyline', 'locus', 'implicit', 'curve'].includes(objType)) {
+                                    api.setLineThickness(name, 2);
+                                }
+                            }
+                            console.log(`[GeoGebra] 3D line thickness reduced to 2`);
+                        } catch { /* 忽略 */ }
+                    }
 
                     // ── 视图调整 ──
                     // 命令执行完毕后调整坐标系，3D 模式需要更长的延迟等待视图初始化
