@@ -3,49 +3,38 @@
 .geogebra-container {
     margin: 1em 0;
     padding: 0;
-    background-color: var(--background-secondary);
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid var(--background-modifier-border);
-    /* Full width of the content area */
+    position: relative;
     width: 100%;
     box-sizing: border-box;
 }
 
-/* ─── Header with mode badge + reset ─── */
+/* ─── Floating toolbar (visible on hover) ─── */
 
 .ggb-header {
     display: flex;
     align-items: center;
-    padding: 6px 12px;
-    background-color: var(--background-secondary-alt);
-    border-bottom: 1px solid var(--background-modifier-border);
+    padding: 4px 8px;
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    z-index: 10;
+    opacity: 0;
+    transition: opacity 0.2s;
+    gap: 6px;
+    pointer-events: none;
+}
+
+.geogebra-container:hover .ggb-header {
+    opacity: 1;
+    pointer-events: auto;
 }
 
 .ggb-mode-badge {
-    font-size: 0.75em;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 2px 8px;
-    border-radius: 4px;
-    color: var(--text-on-accent);
-}
-
-.geogebra-mode-2d .ggb-mode-badge {
-    background-color: #2196F3;
-}
-
-.geogebra-mode-3d .ggb-mode-badge {
-    background-color: #9C27B0;
-}
-
-.geogebra-mode-graph .ggb-mode-badge {
-    background-color: #4CAF50;
+    display: none;
 }
 
 .ggb-header-spacer {
-    flex: 1;
+    display: none;
 }
 
 /* ─── Button group ─── */
@@ -60,19 +49,20 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 0.78em;
+    font-size: 0.75em;
     padding: 3px 10px;
     border-radius: 4px;
-    border: 1px solid var(--background-modifier-border);
-    background-color: var(--background-primary);
-    color: var(--text-normal);
+    border: none;
+    background-color: rgba(0, 0, 0, 0.5);
+    color: #fff;
     cursor: pointer;
-    transition: background-color 0.15s, opacity 0.15s, border-color 0.15s;
+    transition: background-color 0.15s;
     white-space: nowrap;
+    backdrop-filter: blur(4px);
 }
 
 .ggb-header-btn:hover:not([disabled]) {
-    background-color: var(--background-modifier-hover);
+    background-color: rgba(0, 0, 0, 0.7);
 }
 
 .ggb-header-btn[disabled] {
@@ -104,6 +94,7 @@
     background-color: white;
     overflow: hidden;
     box-sizing: border-box;
+    border-radius: 4px;
 }
 
 .theme-dark .ggb-applet-container {
