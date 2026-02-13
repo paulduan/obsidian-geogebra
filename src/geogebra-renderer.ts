@@ -131,6 +131,8 @@ export interface AppletParams {
     center?: number[];
     /** Zoom level (visible units from center): used with @center */
     zoom?: number;
+    /** Scale factor: scales everything (text, points, lines) proportionally. e.g. 0.6 = 60% */
+    scale?: number;
 }
 
 function parseSource(source: string): { params: AppletParams; commands: string[] } {
@@ -179,6 +181,10 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
                 case 'zoom':
                     // @zoom 10  — visible units from center in each direction
                     params.zoom = parseFloat(val);
+                    break;
+                case 'scale':
+                    // @scale 0.6  — scale everything (text, lines, points) to 60%
+                    params.scale = parseFloat(val);
                     break;
                 case 'range': {
                     // @range xMin,xMax,yMin,yMax  e.g. @range -10,10,-5,5
@@ -271,23 +277,54 @@ export async function renderGeoGebra(
 
         const measuredWidth = appletDiv.clientWidth || appletDiv.offsetWidth
             || container.clientWidth || container.offsetWidth || 800;
+        const scale = userParams.scale || 1;
+        // GeoGebra renders at full (unscaled) size; CSS transform handles scaling
         const width = userParams.width || Math.max(measuredWidth, 400);
         const height = userParams.height || DEFAULT_HEIGHTS[mode];
+        // Visual size after CSS transform
+        const visualWidth = Math.round(width * scale);
+        const visualHeight = Math.round(height * scale);
 
-        // Apply user-specified height to the container so it doesn't collapse
-        if (userParams.height) {
+        // Constrain container to visual (scaled) size immediately — this
+        // ensures PDF re-render (cache path) also respects the scale.
+        // Only the CSS transform is deferred until applet actually loads.
+        if (scale !== 1) {
+            container.style.maxWidth = `${visualWidth}px`;
+            container.style.height = `${visualHeight}px`;
+            container.style.overflow = 'hidden';
+        } else if (userParams.height) {
             appletDiv.style.minHeight = `${userParams.height}px`;
         }
 
-        console.log(`[GeoGebra] Measured container width: ${measuredWidth}px → using ${width}x${height}`);
+        // CSS transform applied after applet loads (deferred to avoid
+        // polluting DOM during PDF re-render when cache is used)
+        const applyScale = () => {
+            if (scale !== 1) {
+                appletDiv.style.transformOrigin = 'top left';
+                appletDiv.style.transform = `scale(${scale})`;
+                appletDiv.style.width = `${width}px`;
+                appletDiv.style.height = `${height}px`;
+            }
+        };
+
+        console.log(`[GeoGebra] Size: render ${width}x${height}, scale ${scale}, visual ${visualWidth}x${visualHeight}`);
 
         await new Promise<void>((resolve, reject) => {
             // Shorter timeout when cache is available (just for live upgrade attempt)
             const timeoutMs = hasCachedContent ? 15000 : 60000;
             const timeout = setTimeout(() => {
+                window.removeEventListener('error', errorHandler);
                 if (hasCachedContent) {
                     // Cache available — silently give up on live applet
                     console.log(`[GeoGebra] Live applet timed out but cache available, using cached content`);
+                    // Clean up partially loaded applet DOM to avoid PDF renderer issues
+                    appletDiv.innerHTML = '';
+                    appletDiv.style.display = 'none';
+                    loadingEl.remove();
+                    container.classList.add('ggb-cache-only');
+                    // Release fixed height so cached image uses its natural size
+                    container.style.height = '';
+                    container.style.overflow = '';
                     resolve();
                 } else {
                     const errMsg = errorCapture.length > 0
@@ -332,6 +369,7 @@ export async function renderGeoGebra(
                     // Live applet loaded — hide cached export, show applet
                     exportDiv.classList.remove('ggb-export-active');
                     appletDiv.style.display = '';
+                    applyScale();
 
                     // Apply grid/axes settings before commands
                     if (userParams.grid !== undefined) {
@@ -434,42 +472,29 @@ export async function renderGeoGebra(
                         }
                     };
 
+                    // Always use PNG for cache — SVG can crash Electron's PDF renderer
                     const injectExportContent = () => {
-                        if (mode !== RenderMode.Geometry3D) {
-                            try {
-                                api.exportSVG((svg: string) => {
-                                    if (svg && svg.length > 100) {
-                                        exportDiv.innerHTML = svg
-                                            .replace(/rgb\(0%, 0%, 0%\)/g, 'currentColor')
-                                            .replace(/#000000/g, 'currentColor');
-                                        saveExportToCache();
-                                        console.log(`[GeoGebra] SVG export cached (${svg.length} chars)`);
-                                    } else {
-                                        injectPNGFallback();
-                                    }
-                                });
-                            } catch {
-                                injectPNGFallback();
-                            }
-                        } else {
-                            injectPNGFallback();
-                        }
+                        injectPNGFallback();
                     };
+
+                    // Build img tag with explicit visual width baked in
+                    const mkImg = (b64: string) =>
+                        `<img src="data:image/png;base64,${b64}" class="ggb-export-img" style="width:${visualWidth}px;max-width:100%;height:auto;" alt="GeoGebra ${mode}">`;
 
                     const injectPNGFallback = () => {
                         try {
-                            const b64 = api.getPNGBase64(1, false, 72);
+                            const b64 = api.getPNGBase64(2, false, 144);
                             if (b64 && b64.length > 100) {
-                                exportDiv.innerHTML = `<img src="data:image/png;base64,${b64}" class="ggb-export-img" alt="GeoGebra ${mode}">`;
+                                exportDiv.innerHTML = mkImg(b64);
                                 saveExportToCache();
-                                console.log(`[GeoGebra] PNG export cached`);
+                                console.log(`[GeoGebra] PNG export cached (visual ${visualWidth}px)`);
                                 return;
                             }
                         } catch { /* ignore */ }
                         try {
                             api.getScreenshotBase64((b64: string) => {
                                 if (b64 && b64.length > 100) {
-                                    exportDiv.innerHTML = `<img src="data:image/png;base64,${b64}" class="ggb-export-img" alt="GeoGebra ${mode}">`;
+                                    exportDiv.innerHTML = mkImg(b64);
                                     saveExportToCache();
                                     console.log(`[GeoGebra] Screenshot export cached`);
                                 }
@@ -539,8 +564,10 @@ export async function renderGeoGebra(
             console.log(`[GeoGebra] Render failed but cache available — showing cached content`);
             appletDiv.style.display = 'none';
             exportDiv.classList.add('ggb-export-active');
-            // Strip container decorations for clean PDF output
             container.classList.add('ggb-cache-only');
+            // Release fixed height so cached image uses its natural size
+            container.style.height = '';
+            container.style.overflow = '';
         } else {
             const msg = (e as Error).message || String(e);
             container.createDiv({

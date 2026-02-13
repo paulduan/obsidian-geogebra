@@ -178,6 +178,10 @@
     display: none !important;
 }
 
+.geogebra-container.ggb-cache-only .ggb-applet-container {
+    display: none !important;
+}
+
 .ggb-export-container svg {
     width: 100%;
     height: auto;
