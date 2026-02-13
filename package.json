@@ -1,6 +1,6 @@
 {
   "name": "obsidian-geogebra",
-  "version": "1.1.40",
+  "version": "1.1.54",
   "description": "Render GeoGebra code blocks in Obsidian (2D, 3D, graphing) with full CSP bypass",
   "main": "main.js",
   "scripts": {

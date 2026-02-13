@@ -319,8 +319,13 @@ export async function renderGeoGebra(
     // 生成唯一 applet ID（时间戳 + 计数器）
     const appletId = `ggb-applet-${Date.now()}-${++appletCounter}`;
     // applet 容器：GeoGebra 将在此 div 内渲染交互式图形
+    // 注意：不要修改 appletDiv 的 class，scaleContainerClass 依赖 'ggb-applet-container'
     const appletDiv = container.createDiv({ cls: 'ggb-applet-container' });
     appletDiv.id = appletId;
+    // 3D 模式标记加到外层 container 上，用于 CSS 限定 transform-origin 规则
+    if (mode === RenderMode.Geometry3D) {
+        container.classList.add('ggb-3d');
+    }
 
     // 加载提示：如果有缓存内容则隐藏（避免 PDF 导出时显示 "Loading..."）
     const loadingEl = container.createDiv({ cls: 'ggb-loading' });
@@ -386,29 +391,90 @@ export async function renderGeoGebra(
         const visualHeight = Math.round(ggbVisualHeight * scale);
 
         /**
-         * applet 加载后统一应用尺寸调整。
+         * applet 加载后统一修正布局和应用 @scale 缩放。
          *
-         * @scale 的实现：在 appletDiv 上叠加 CSS transform。
-         * GeoGebra 的 scaleContainerClass 作用于 appletDiv 内部的 GeoGebraFrame，
-         * 我们的 transform 作用于 appletDiv 本身，两者在不同的 DOM 层级，不会冲突。
+         * 问题背景：
+         * 当 GeoGebra 的 scaleContainerClass 生效时（如 3D 模式内部宽度 1400px
+         * 缩放到容器的 ~800px），CSS transform 不影响 DOM 布局，导致：
+         * - DOM 高度仍为原始高度（750px），但视觉高度变小（~428px），产生底部间距
+         * - 如果 transform-origin 不是 top left，内容还会偏移
          *
-         * 流程：GeoGebra 内部渲染 → scaleContainerClass 缩放到容器宽度 → CSS transform 再缩放
+         * 修复策略：
+         * 1. CSS 规则强制 transform-origin: top left（在 styles.css 中）
+         * 2. 用 clip-path: inset() 只裁底部间距，绝不裁顶部（避免内容被遮挡）
+         * 3. 用 negative margin-bottom 收缩布局空间（消除间距）
+         * 4. 在此基础上叠加用户的 @scale
+         *
+         * 关键区别：不使用 overflow: hidden（会同时裁掉四个方向），
+         * 而用 clip-path: inset(0 0 GAP 0) 只裁底部。
          */
         const applyAllSizing = () => {
-            // 修正 GeoGebra scaleContainerClass 缩放后的容器高度
             if (ggbScale < 1) {
-                appletDiv.style.height = `${ggbVisualHeight}px`;
+                // ═══ 路径 A：3D 模式（GeoGebra 有内部缩放）═══
+                // scaleContainerClass 把 1400px 缩放到 ~800px，CSS transform 不影响布局，
+                // 导致 DOM 高度（750px）和视觉高度（~428px）不一致 → 底部间距。
+                // 用 clip-path 只裁底部，不裁顶部。
+                setTimeout(() => {
+                    const domH = appletDiv.scrollHeight || appletDiv.offsetHeight;
+
+                    // 测量 GeoGebra 内部 frame 的实际视觉高度
+                    let visualH = ggbVisualHeight;
+                    try {
+                        for (const el of appletDiv.querySelectorAll('*')) {
+                            const cs = window.getComputedStyle(el);
+                            if (cs.transform && cs.transform !== 'none') {
+                                const rect = (el as HTMLElement).getBoundingClientRect();
+                                if (rect.height > 10) {
+                                    visualH = Math.ceil(rect.height);
+                                }
+                                break;
+                            }
+                        }
+                    } catch { /* 忽略 */ }
+
+                    // clip-path 只裁底部间距，不裁顶部
+                    const bottomGap = Math.max(0, domH - visualH - 5);
+                    if (bottomGap > 0) {
+                        appletDiv.style.clipPath = `inset(0px 0px ${bottomGap}px 0px)`;
+                        appletDiv.style.marginBottom = `-${bottomGap}px`;
+                    }
+
+                    // 叠加 @scale
+                    if (scale !== 1) {
+                        appletDiv.style.transformOrigin = 'top left';
+                        appletDiv.style.transform = `scale(${scale})`;
+                        container.style.width = `${Math.round(measuredWidth * scale)}px`;
+                        container.style.height = `${Math.round(visualH * scale)}px`;
+                        container.style.overflow = 'hidden';
+                    }
+
+                    console.log(`[GeoGebra] 3D layout: domH=${domH}, visualH=${visualH}, gap=${bottomGap}, @scale=${scale}`);
+                }, 600);
+
+            } else if (scale !== 1) {
+                // ═══ 路径 B：2D/Graph 模式 + @scale ═══
+                // 无内部缩放，只需应用 CSS transform。
+                // 不使用 overflow:hidden（会裁掉顶部溢出的内容），
+                // 改用 negative margin 收缩底部间距。
+                setTimeout(() => {
+                    const actualH = appletDiv.scrollHeight || appletDiv.offsetHeight;
+                    appletDiv.style.transformOrigin = 'top left';
+                    appletDiv.style.transform = `scale(${scale})`;
+
+                    // transform 不影响布局，appletDiv 仍占原始高度的空间。
+                    // 用 negative margin 把多余的空间收回（视觉高度 = actualH * scale）。
+                    const scaledH = Math.round(actualH * scale);
+                    const gap = actualH - scaledH;
+                    if (gap > 0) {
+                        appletDiv.style.marginBottom = `-${gap}px`;
+                    }
+
+                    container.style.width = `${Math.round(measuredWidth * scale)}px`;
+                    // 不设置 container.style.overflow = 'hidden'，避免裁掉顶部内容
+                    console.log(`[GeoGebra] @scale ${scale}: actualH=${actualH}px, scaledH=${scaledH}px, gap=${gap}px`);
+                }, 800); // 800ms 确保 GeoGebra 完全渲染后再测量
             }
-            // 在 GeoGebra 缩放之上叠加用户的 @scale
-            if (scale !== 1) {
-                appletDiv.style.transformOrigin = 'top left';
-                appletDiv.style.transform = `scale(${scale})`;
-                // transform 不影响布局尺寸，需要限制外层容器
-                container.style.width = `${visualWidth}px`;
-                container.style.height = `${visualHeight}px`;
-                container.style.overflow = 'hidden';
-            }
-            console.log(`[GeoGebra] Sizing: internal ${width}x${height}, ggbScale=${ggbScale.toFixed(2)}, userScale=${scale}, visual ${visualWidth}x${visualHeight}`);
+            // 路径 C：2D/Graph 无 @scale → 不做任何调整
         };
 
         console.log(`[GeoGebra] Size: render ${width}x${height}, scale ${scale}, visual ${visualWidth}x${visualHeight}`);
@@ -559,13 +625,95 @@ export async function renderGeoGebra(
                                     api.evalCommand(`SetCoordSystem(${x0}, ${x1}, ${y0}, ${y1}, ${x0}, ${x1})`);
                                     console.log(`[GeoGebra] 3D range set from @range`);
                                 } else {
-                                    // 无参数时自动适配所有对象
+                                    // 无参数时自动适配所有对象：
+                                    // ZoomToFit() 在 3D 模式下效果不佳，改为手动计算所有对象的
+                                    // 3D 包围盒，然后用 SetCoordSystem 设置合适的坐标系范围。
                                     api.evalCommand('SetActiveView(2)');
-                                    try {
-                                        api.evalCommand('SelectAll()');
-                                        api.evalCommand('ZoomToFit()');
-                                        api.evalCommand('SelectAll()');
-                                    } catch {}
+                                    const autoFit3D = () => {
+                                        try {
+                                            const names = api.getAllObjectNames() || [];
+                                            let mnX = Infinity, mxX = -Infinity;
+                                            let mnY = Infinity, mxY = -Infinity;
+                                            let mnZ = Infinity, mxZ = -Infinity;
+                                            let found = false;
+
+                                            // 只收集几何对象（点、线段端点等）的坐标，
+                                            // 排除 slider/numeric/angle/boolean/function/text 等
+                                            // 非几何对象——它们的 getXcoord 返回值不是空间坐标，
+                                            // 会把包围盒撑得很大。
+                                            const skipTypes = new Set([
+                                                'numeric', 'angle', 'boolean', 'function',
+                                                'text', 'list', 'image',
+                                            ]);
+
+                                            for (const nm of names) {
+                                                try {
+                                                    const objType = api.getObjectType(nm);
+                                                    if (skipTypes.has(objType)) continue;
+
+                                                    // 方法1：对点对象直接获取坐标
+                                                    if (objType === 'point' || objType === 'point3d') {
+                                                        const px = api.getXcoord(nm);
+                                                        const py = api.getYcoord(nm);
+                                                        if (typeof px === 'number' && !isNaN(px) &&
+                                                            typeof py === 'number' && !isNaN(py)) {
+                                                            mnX = Math.min(mnX, px); mxX = Math.max(mxX, px);
+                                                            mnY = Math.min(mnY, py); mxY = Math.max(mxY, py);
+                                                            found = true;
+                                                        }
+                                                    }
+
+                                                    // 方法2：解析值字符串中的 3D 坐标 "(x, y, z)"
+                                                    // 适用于 point3d 以及内嵌坐标的其他对象
+                                                    const vs = api.getValueString(nm) || '';
+                                                    const coordRegex = /\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/g;
+                                                    let m3;
+                                                    while ((m3 = coordRegex.exec(vs)) !== null) {
+                                                        const xv = parseFloat(m3[1]);
+                                                        const yv = parseFloat(m3[2]);
+                                                        const zv = parseFloat(m3[3]);
+                                                        if (!isNaN(xv)) { mnX = Math.min(mnX, xv); mxX = Math.max(mxX, xv); }
+                                                        if (!isNaN(yv)) { mnY = Math.min(mnY, yv); mxY = Math.max(mxY, yv); }
+                                                        if (!isNaN(zv)) { mnZ = Math.min(mnZ, zv); mxZ = Math.max(mxZ, zv); }
+                                                        found = true;
+                                                    }
+                                                } catch { /* 忽略单个对象的错误 */ }
+                                            }
+
+                                            if (found) {
+                                                // z 轴如果没有 3D 坐标数据，默认 ±5
+                                                if (mnZ === Infinity) { mnZ = -5; mxZ = 5; }
+
+                                                // 每个轴独立计算范围和 padding
+                                                const axisPad = (min: number, max: number) => {
+                                                    const range = max - min || 10;
+                                                    const p = range * 0.25 + 2; // 25% padding + 2 单位缓冲
+                                                    return [min - p, max + p] as [number, number];
+                                                };
+                                                const [x0, x1] = axisPad(mnX, mxX);
+                                                const [y0, y1] = axisPad(mnY, mxY);
+                                                const [z0, z1] = axisPad(mnZ, mxZ);
+
+                                                api.evalCommand('SetActiveView(2)');
+                                                const cmd = `SetCoordSystem(${x0}, ${x1}, ${y0}, ${y1}, ${z0}, ${z1})`;
+                                                api.evalCommand(cmd);
+                                                console.log(`[GeoGebra] 3D auto-fit: x=[${x0.toFixed(1)},${x1.toFixed(1)}] y=[${y0.toFixed(1)},${y1.toFixed(1)}] z=[${z0.toFixed(1)},${z1.toFixed(1)}]`);
+                                                try { api.setCoordSystem(x0, x1, y0, y1, z0, z1); } catch {}
+                                            } else {
+                                                // 无法获取坐标，使用较宽的默认范围
+                                                apply3DView(api, 0, 0, 0, 15);
+                                            }
+                                        } catch {
+                                            try {
+                                                api.evalCommand('SelectAll()');
+                                                api.evalCommand('ZoomToFit()');
+                                                api.evalCommand('SelectAll()');
+                                            } catch { /* 忽略 */ }
+                                        }
+                                    };
+                                    autoFit3D();
+                                    // 3D 视图初始化较慢，1 秒后重试确保生效
+                                    setTimeout(autoFit3D, 1000);
                                 }
                             } else if (userParams.range) {
                                 // ── 2D 精确坐标范围 ──
@@ -575,16 +723,106 @@ export async function renderGeoGebra(
                             } else if (userParams.center) {
                                 // ── 2D 中心点 + 缩放 ──
                                 const [cx, cy] = userParams.center;
-                                const z = userParams.zoom || 10;
+                                let z = userParams.zoom || 0;
+
+                                // zoom 必须为正数（半径）。如果 ≤ 0 或未设置，
+                                // 从包围盒自动计算：取中心到最远点的距离 + padding。
+                                if (z <= 0) {
+                                    try {
+                                        const names2 = api.getAllObjectNames() || [];
+                                        const skip2 = new Set(['numeric','angle','boolean','function','text','list','image']);
+                                        let maxDist = 0;
+                                        for (const nm of names2) {
+                                            try {
+                                                const ot = api.getObjectType(nm);
+                                                if (skip2.has(ot)) continue;
+                                                if (ot === 'point') {
+                                                    const px = api.getXcoord(nm);
+                                                    const py = api.getYcoord(nm);
+                                                    if (typeof px === 'number' && !isNaN(px) &&
+                                                        typeof py === 'number' && !isNaN(py)) {
+                                                        maxDist = Math.max(maxDist,
+                                                            Math.abs(px - cx), Math.abs(py - cy));
+                                                    }
+                                                }
+                                            } catch { /* 忽略 */ }
+                                        }
+                                        z = maxDist > 0 ? maxDist * 1.3 + 2 : 10;
+                                    } catch { z = 10; }
+                                    console.log(`[GeoGebra] 2D auto-zoom from bbox: z=${z.toFixed(1)}`);
+                                }
+
                                 api.setCoordSystem(cx - z, cx + z, cy - z, cy + z);
-                                console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z}`);
+                                console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z.toFixed(1)}`);
                             } else {
-                                // ── 自动适配 ──
+                                // ── 2D 自动适配：计算包围盒 + padding ──
+                                // ZoomToFit() 不留足够 padding，标签/对象在画布边缘被截断。
+                                // 改为手动计算所有点的包围盒，设置带 padding 的坐标系。
                                 try {
-                                    api.evalCommand('SelectAll()');
-                                    api.evalCommand('ZoomToFit()');
-                                    api.evalCommand('SelectAll()');
-                                } catch {}
+                                    const names = api.getAllObjectNames() || [];
+                                    const skip = new Set([
+                                        'numeric', 'angle', 'boolean', 'function',
+                                        'text', 'list', 'image',
+                                    ]);
+                                    let mnX = Infinity, mxX = -Infinity;
+                                    let mnY = Infinity, mxY = -Infinity;
+                                    let found2d = false;
+
+                                    for (const nm of names) {
+                                        try {
+                                            const ot = api.getObjectType(nm);
+                                            if (skip.has(ot)) continue;
+
+                                            if (ot === 'point') {
+                                                const px = api.getXcoord(nm);
+                                                const py = api.getYcoord(nm);
+                                                if (typeof px === 'number' && !isNaN(px) &&
+                                                    typeof py === 'number' && !isNaN(py)) {
+                                                    mnX = Math.min(mnX, px); mxX = Math.max(mxX, px);
+                                                    mnY = Math.min(mnY, py); mxY = Math.max(mxY, py);
+                                                    found2d = true;
+                                                }
+                                            }
+
+                                            // 也从值字符串解析 "(x, y)" 坐标
+                                            const vs = api.getValueString(nm) || '';
+                                            const coordRe = /\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/g;
+                                            let mc;
+                                            while ((mc = coordRe.exec(vs)) !== null) {
+                                                const xv = parseFloat(mc[1]);
+                                                const yv = parseFloat(mc[2]);
+                                                if (!isNaN(xv) && !isNaN(yv)) {
+                                                    mnX = Math.min(mnX, xv); mxX = Math.max(mxX, xv);
+                                                    mnY = Math.min(mnY, yv); mxY = Math.max(mxY, yv);
+                                                    found2d = true;
+                                                }
+                                            }
+                                        } catch { /* 忽略 */ }
+                                    }
+
+                                    if (found2d) {
+                                        const axisPad2d = (min: number, max: number) => {
+                                            const range = max - min || 10;
+                                            const p = range * 0.25 + 2;
+                                            return [min - p, max + p] as [number, number];
+                                        };
+                                        const [x0, x1] = axisPad2d(mnX, mxX);
+                                        const [y0, y1] = axisPad2d(mnY, mxY);
+                                        api.setCoordSystem(x0, x1, y0, y1);
+                                        console.log(`[GeoGebra] 2D auto-fit: x=[${x0.toFixed(1)},${x1.toFixed(1)}] y=[${y0.toFixed(1)},${y1.toFixed(1)}]`);
+                                    } else {
+                                        // 无点坐标，回退到 ZoomToFit
+                                        api.evalCommand('SelectAll()');
+                                        api.evalCommand('ZoomToFit()');
+                                        api.evalCommand('SelectAll()');
+                                    }
+                                } catch {
+                                    try {
+                                        api.evalCommand('SelectAll()');
+                                        api.evalCommand('ZoomToFit()');
+                                        api.evalCommand('SelectAll()');
+                                    } catch { /* 忽略 */ }
+                                }
                             }
                             console.log(`[GeoGebra] View adjustment applied`);
                         } catch (e) {
@@ -593,8 +831,8 @@ export async function renderGeoGebra(
                     }, viewDelay);
 
                     // ── 保存初始状态（用于重置按钮） ──
-                    // 3D + center/zoom 需要更长延迟（等待重试完成）
-                    const saveDelay = (mode === RenderMode.Geometry3D && (userParams.center || userParams.zoom)) ? 2500 : 800;
+                    // 3D 模式有视图调整重试（1s后），需要更长延迟等待完成
+                    const saveDelay = mode === RenderMode.Geometry3D ? 2500 : 800;
                     setTimeout(() => {
                         try {
                             // 通过 getBase64() 保存完整的 applet 状态（XML + 构造数据）
