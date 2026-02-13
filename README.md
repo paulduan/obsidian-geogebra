@@ -1,32 +1,31 @@
 # Obsidian GeoGebra Plugin
 
-在 Obsidian 笔记中直接渲染 GeoGebra 图形。支持 2D 几何、3D 几何和函数图像三种模式，使用 GeoGebra 原生 API 渲染，完整支持 GeoGebra 命令语法。
+在 Obsidian 中渲染交互式 GeoGebra 图形。支持 2D 几何、3D 几何和函数图像三种模式，使用 GeoGebra 原生 API，完整支持 GeoGebra 命令语法。
 
 ## 功能
 
-- **三种渲染模式**：2D 几何、3D 几何、函数图像
-- **代数面板**：左侧显示所有变量、公式和滑块
-- **动画支持**：通过 `SetAnimating` / `StartAnimation` 驱动点动画
-- **自定义参数**：通过 `@key value` 控制画布大小、视图布局等
-- **重置按钮**：一键恢复到初始状态（而非清空画布）
-- **导出 PNG**：点击 Export 按钮下载当前图形为 PNG 图片
-- **PDF 导出支持**：Obsidian 导出 PDF 时自动将动态图形替换为静态截图
-- **完整 CSP 绕过**：自动处理 Obsidian 的内容安全策略限制
+- **三种渲染模式**：2D 几何（`classic`）、3D 几何（`3d`）、函数图像（`graphing`）
+- **完整 GeoGebra 命令**：支持所有 GeoGebra 构造命令和 API 调用
+- **动画支持**：通过 `SetAnimating` / `StartAnimation` 驱动滑块和点动画
+- **自定义参数**：通过 `@key value` 控制画布大小、视图范围、缩放等
+- **重置按钮**：悬停显示，一键恢复到初始状态
+- **PDF 导出**：自动将动态图形替换为静态 PNG 截图
+- **CSP 绕过**：自动处理 Obsidian Electron 环境的内容安全策略限制
 
 ## 安装
 
-### 方式一：直接复制（推荐）
+### 方式一：直接复制
 
-1. 将以下三个文件复制到你的 Obsidian vault 的插件目录：
+将以下三个文件复制到 vault 插件目录：
 
 ```
-<你的vault>/.obsidian/plugins/obsidian-geogebra/
+<vault>/.obsidian/plugins/obsidian-geogebra/
 ├── main.js
 ├── manifest.json
 └── styles.css
 ```
 
-2. 重启 Obsidian，在 **设置 → 社区插件** 中启用 "GeoGebra Renderer"。
+重启 Obsidian，在 **设置 → 社区插件** 中启用 "GeoGebra Renderer"。
 
 ### 方式二：从源码构建
 
@@ -37,17 +36,19 @@ npm install
 npm run build
 ```
 
-构建完成后，将 `main.js`、`manifest.json`、`styles.css` 复制到你的 vault 插件目录。
+构建完成后，将 `main.js`、`manifest.json`、`styles.css` 复制到 vault 插件目录。
 
 ## 使用方法
 
 在 Obsidian 笔记中创建代码块，语言标识决定渲染模式：
 
-| 语言标识 | 模式 | 说明 |
-|---------|------|------|
-| `geogebra` 或 `ggb` | 2D 几何 | 平面几何、解析几何 |
-| `geogebra-3d` 或 `ggb-3d` | 3D 几何 | 空间几何、立体图形 |
-| `geogebra-graph` 或 `ggb-graph` | 函数图像 | 函数绘图 |
+| 语言标识 | 模式 | GeoGebra 引擎 | 适用场景 |
+|---------|------|---------------|---------|
+| `geogebra` / `ggb` | 2D 几何 | `classic` | 平面几何、解析几何、滑块、Locus |
+| `geogebra-3d` / `ggb-3d` | 3D 几何 | `3d` | 空间几何、立体图形 |
+| `geogebra-graph` / `ggb-graph` | 函数图像 | `graphing` | 纯函数绘图 |
+
+> **注意**：`Segment`、`Point(path)`、`Locus`、`Slider` 等几何命令仅在 `classic` 引擎中可用。如果需要这些命令，请使用 `geogebra` 而非 `geogebra-graph`。
 
 ### 基本示例
 
@@ -83,9 +84,22 @@ g(x) = cos(x)
 ```
 ````
 
+#### 滑块与轨迹（需使用 `geogebra`）
+
+````markdown
+```geogebra
+a = Slider(0, 2, 0.01)
+f = Segment((0,0), (0,a))
+A = Point(f, 1)
+t = y(A)
+H = (sin(2π*t), 2t^(2))
+c = Locus(H, A)
+```
+````
+
 ### 参数控制
 
-在代码块开头使用 `@key value` 语法设置参数：
+在代码块开头使用 `@key value` 设置参数：
 
 ````markdown
 ```geogebra
@@ -102,18 +116,19 @@ Line(A, B)
 
 | 参数 | 说明 | 默认值 | 示例 |
 |------|------|--------|------|
-| `@height` | 画布高度（像素） | 2D: 500, 3D: 750, Graph: 500 | `@height 700` |
-| `@width` | 画布宽度（像素） | 自动适应容器宽度 | `@width 900` |
+| `@height` | 画布高度（px） | 2D: 500, 3D: 750, Graph: 500 | `@height 700` |
+| `@width` | 画布宽度（px） | 自动适应容器 | `@width 900` |
 | `@perspective` | 视图布局 | 2D/Graph: `AG`, 3D: `AT` | `@perspective G` |
 | `@toolbar` | 显示工具栏 | `false` | `@toolbar true` |
 | `@grid` | 显示网格 | GeoGebra 默认 | `@grid true` |
 | `@axes` | 显示坐标轴 | GeoGebra 默认 | `@axes true` |
-| `@keyboard` | 显示左下角虚拟键盘按钮 | `true` | `@keyboard false` |
-| `@center` | 视图中心点坐标 | 自动 | 2D: `@center 3,5`　3D: `@center 0,0,6` |
-| `@zoom` | 视野范围（从中心到边界的单位数） | `15` | `@zoom 20` |
+| `@keyboard` | 显示虚拟键盘/代数输入 | `true` | `@keyboard false` |
+| `@center` | 视图中心点 | 自动 | `@center 3,5` / `@center 0,0,6` |
+| `@zoom` | 从中心到边界的可见单位数 | `15` | `@zoom 20` |
 | `@range` | 坐标系精确范围 | 自动 | `@range -10,10,-5,5` |
+| `@scale` | 整体缩放比例 | `1` | `@scale 0.6` |
 
-#### 视图布局（perspective）说明
+#### 视图布局（perspective）
 
 | 字符 | 含义 |
 |------|------|
@@ -122,32 +137,11 @@ Line(A, B)
 | `T` | 3D 视图（Three-D） |
 | `S` | 电子表格（Spreadsheet） |
 
-组合示例：
-- `AG` — 代数面板 + 平面图形（默认）
-- `G` — 仅平面图形（无代数面板）
-- `AT` — 代数面板 + 3D 视图
-- `AGT` — 代数面板 + 平面图形 + 3D 视图
+组合示例：`AG`（默认）、`G`（仅图形）、`AT`（代数 + 3D）、`AGT`（代数 + 图形 + 3D）
 
-#### 视图控制（center / zoom / range）
+#### 视图控制
 
-通过 `@center`、`@zoom`、`@range` 控制视图的初始位置和缩放。
-
-**`@center`** — 设置视图中心点：
-
-- 2D 模式：`@center x,y`，例如 `@center 3,5`
-- 3D 模式：`@center x,y,z`，例如 `@center 0,0,6`
-
-**`@zoom`** — 设置视野范围（从中心到边界的单位数），通常与 `@center` 搭配使用：
-
-- 默认值 `15`，即中心向各方向可见 15 个单位
-- `@zoom 5` 表示放大视图，`@zoom 50` 表示缩小视图
-
-**`@range`** — 精确指定坐标系范围（优先级高于 center/zoom）：
-
-- 格式：`@range xMin,xMax,yMin,yMax`
-- 3D 模式下 zMin/zMax 自动取 xMin/xMax 的值
-
-**示例：2D 指定视图中心和缩放**
+**`@center` + `@zoom`** — 设置视图中心和可见范围：
 
 ````markdown
 ```geogebra
@@ -160,19 +154,7 @@ Segment(A, B)
 ```
 ````
 
-**示例：3D 指定视图中心**
-
-````markdown
-```geogebra-3d
-@center 0,0,6
-@zoom 15
-A = (0, 0, 0)
-B = (0, 0, 12)
-cyl = Cylinder(A, B, 2)
-```
-````
-
-**示例：精确指定坐标范围**
+**`@range`** — 精确指定坐标系范围（优先级高于 center/zoom）：
 
 ````markdown
 ```geogebra
@@ -181,9 +163,21 @@ f(x) = x^2 / 10
 ```
 ````
 
-### 动画示例
+**`@scale`** — 缩放整个画布（文字、线条、点等比例缩放）：
 
-```markdown
+````markdown
+```geogebra
+@scale 0.6
+@height 800
+A = (0,0)
+B = (10,10)
+Circle(A, B)
+```
+````
+
+### 动画
+
+````markdown
 ```geogebra
 @height 600
 n = Slider(1, 10, 1)
@@ -191,11 +185,11 @@ A = (n, n^2)
 SetAnimating(n, true)
 StartAnimation()
 ```
-```
+````
 
 ### API 命令
 
-除了标准的 GeoGebra 构造命令外，还支持以下脚本命令（直接调用 GeoGebra API）：
+除标准 GeoGebra 构造命令外，支持以下脚本命令（直接调用 GeoGebra JS API）：
 
 | 命令 | 说明 |
 |------|------|
@@ -211,90 +205,62 @@ StartAnimation()
 | `SetCaption(name, "text")` | 设置标签 |
 | `SetLabelVisible(name, true/false)` | 显示/隐藏标签 |
 
-### 导出与 PDF
+### PDF 导出
 
-#### 导出 PNG
-
-每个 GeoGebra 代码块的标题栏都有一个 **Export** 按钮，点击后会以 PNG 格式（2x 缩放、300 DPI）下载当前图形。
-
-#### PDF 导出
-
-通过 Obsidian 的 **文件 → 导出为 PDF** 功能导出时，插件会自动将动态 GeoGebra 图形替换为静态截图（在 applet 加载完成后自动捕获）。
+通过 Obsidian 的 **文件 → 导出为 PDF** 时，插件自动将交互式 applet 替换为静态 PNG 截图。
 
 工作原理：
-- Applet 初始化完成后自动截取一张 PNG 快照，存储为隐藏的 `<img>` 元素
-- CSS `@media print` 规则在打印/导出时隐藏动态 applet，显示静态图片
-- 导出的 PDF 中会包含图形的完整截图
+1. Applet 加载完成后自动截取 PNG 快照，存入缓存（文件 + localStorage）
+2. 用户交互（拖拽、滑块）后自动更新快照
+3. CSS `@media print` 规则在导出时隐藏动态 applet，显示静态图片
 
-> **注意**：PDF 中的图形为截图时刻的静态快照。如果之后通过滑块或拖拽改变了图形，PDF 中仍为初始状态的截图。
+缓存目录可在 **设置 → GeoGebra Renderer → Cache directory** 中修改。
+
+> PDF 中的图形为最后一次截图的快照。
 
 ## 开发
 
 ### 项目结构
 
 ```
-obsidian-geogebra-plugin/
-├── src/
-│   ├── main.ts              # 插件入口，注册代码块处理器
-│   ├── geogebra-loader.ts   # CSP 绕过，资源加载拦截
-│   ├── geogebra-renderer.ts # GeoGebra applet 创建与命令执行
-│   └── types.ts             # 类型定义
-├── styles.css               # 插件样式
-├── manifest.json            # Obsidian 插件清单
-├── esbuild.config.mjs       # 构建配置
-├── version-bump.mjs         # 自动递增 patch 版本号
-├── deploy.mjs               # 部署脚本（复制到 vault）
-├── package.json
-└── tsconfig.json
+src/
+├── main.ts              # 插件入口，注册代码块处理器
+├── geogebra-loader.ts   # CSP 绕过，DOM/XHR/Fetch 拦截
+├── geogebra-renderer.ts # Applet 创建、命令执行、视图调整、缓存
+└── types.ts             # RenderMode 枚举、语言映射
+styles.css               # 插件样式
+manifest.json            # Obsidian 插件清单
+esbuild.config.mjs       # 构建配置
+version-bump.mjs         # 自动递增 patch 版本号
+deploy.mjs               # 部署到 vault 的脚本
 ```
 
 ### 构建命令
 
 ```bash
-# 安装依赖
-npm install
-
-# 开发构建
-npm run dev
-
-# 生产构建
-npm run build
-
-# 构建并部署到 vault（自动递增版本号，需修改 deploy.mjs 中的路径）
-npm run deploy
-
-# 仅递增版本号（不构建不部署）
-npm run version-bump
+npm install        # 安装依赖
+npm run dev        # 开发构建（含 sourcemap）
+npm run build      # 生产构建（压缩）
+npm run deploy     # 递增版本 + 构建 + 部署到 vault
 ```
 
-### 部署脚本
+### 部署
 
-`npm run deploy` 会依次执行：
-1. **`version-bump.mjs`** — 自动递增 patch 版本号（如 `1.1.1` → `1.1.2`），同时更新 `manifest.json` 和 `package.json`
-2. **`npm run build`** — 编译 TypeScript
-3. **`deploy.mjs`** — 复制构建产物到 Obsidian vault
+`npm run deploy` 依次执行：version-bump → build → deploy。
 
-首次使用前需修改 `deploy.mjs` 中的 `VAULT_PLUGIN_DIR` 路径为你自己的 vault 位置：
+首次使用需修改 `deploy.mjs` 中的 `VAULT_PLUGIN_DIR` 为你的 vault 路径。
 
-```javascript
-const VAULT_PLUGIN_DIR = join(
-  process.env.HOME,
-  "Library/Mobile Documents/iCloud~md~obsidian/Documents/<你的vault名>/.obsidian/plugins/obsidian-geogebra"
-);
-```
+### CSP 绕过原理
 
-### 技术原理
+Obsidian (Electron) 的 CSP 阻止从外部加载脚本和样式。本插件通过多层拦截绕过：
 
-Obsidian (Electron) 有严格的内容安全策略（CSP），阻止从外部 CDN 加载脚本和样式。本插件通过多层拦截绕过这一限制：
+1. **DOM 拦截** — Patch `appendChild` / `insertBefore`，将外部脚本转为 Blob URL 加载
+2. **Script.src 拦截** — Patch `HTMLScriptElement.prototype.src`，捕获动态加载的字体等资源
+3. **XHR / Fetch 拦截** — 代理 GeoGebra 的数据请求
+4. **跨 iframe 补丁** — 递归 patch GWT iframe 的 `Node.prototype`
+5. **URL 修正** — 将 `app://obsidian.md/` 开头的错误路径重定向到 GeoGebra CDN
 
-1. **DOM 拦截**：Patch `Node.prototype.appendChild`/`insertBefore`，捕获 `<script>` 和 `<link>` 元素的插入
-2. **Script src 拦截**：Patch `HTMLScriptElement.prototype.src` setter，捕获字体等资源的加载
-3. **XHR/Fetch 拦截**：Patch `XMLHttpRequest` 和 `window.fetch`，代理 GeoGebra 的数据请求
-4. **跨 iframe 补丁**：GWT 框架在 iframe 中运行，递归 patch iframe 的 `Node.prototype`
-5. **Blob URL 执行**：将拦截的脚本内容转为 Blob URL，在正确的 iframe 上下文中执行
-6. **URL 重定向**：将 `app://obsidian.md/` 开头的错误路径重定向到正确的 GeoGebra CDN 地址
-
-所有外部请求通过 Obsidian 的 `requestUrl()` API（基于 Node.js HTTP）完成，不受浏览器 CSP 限制。
+所有外部请求通过 Obsidian 的 `requestUrl()` API（Node.js HTTP）完成，不受浏览器 CSP 限制。
 
 ## 许可
 

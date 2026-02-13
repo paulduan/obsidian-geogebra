@@ -1,25 +1,45 @@
 /**
- * GeoGebra Renderer
+ * GeoGebra 渲染器
  *
- * Creates real GeoGebra applets and executes GeoGebra commands
- * via the evalCommand API. Full GeoGebra compatibility.
+ * 核心模块，负责：
+ * 1. 解析代码块中的参数（@height, @range 等）和 GeoGebra 命令
+ * 2. 创建 GeoGebra applet 实例并注入到 DOM
+ * 3. 执行 GeoGebra 命令（evalCommand）和 API 调用（SetColor 等）
+ * 4. 调整视图（坐标系范围、缩放、居中）
+ * 5. 生成 PNG 快照并缓存（用于 PDF 导出）
+ * 6. 提供重置功能（恢复到初始状态）
  */
 import { loadGeoGebra, getGeoGebraVersion } from './geogebra-loader';
 import { RenderMode } from './types';
 import type { Vault } from 'obsidian';
 
+/** GGBApplet 由 deployggb.js 动态注入到 window 上，这里声明类型 */
 declare const GGBApplet: any;
 
-// ─── File-based cache for PDF export ───
+// ─── 文件缓存系统（用于 PDF 导出） ───────────────────────────
+// PDF 导出时 Obsidian 会重新渲染 markdown，但不会等待 GeoGebra 从 CDN 加载。
+// 缓存机制在首次渲染后保存 PNG 快照，PDF 导出时直接使用缓存。
+// 采用双层缓存：文件缓存（持久化）+ localStorage（快速回退）。
+
+/** Obsidian vault 引用，用于读写缓存文件 */
 let cacheVault: Vault | null = null;
+/** 缓存目录路径（相对于 vault 根目录） */
 let cacheDirPath = '.obsidian/plugins/obsidian-geogebra/cache';
 
-/** Called from main.ts to set vault reference and cache directory */
+/**
+ * 设置缓存目录。由 main.ts 在插件加载时调用。
+ * @param vault Obsidian vault 实例
+ * @param dir 缓存目录的相对路径
+ */
 export function setCacheDir(vault: Vault, dir: string): void {
     cacheVault = vault;
     cacheDirPath = dir;
 }
 
+/**
+ * 根据渲染模式和源码内容生成缓存键。
+ * 使用简单哈希算法（DJB2 变体），将模式+源码映射为唯一字符串。
+ */
 function makeCacheKey(mode: RenderMode, source: string): string {
     let hash = 0;
     const str = mode + ':' + source.trim();
@@ -29,32 +49,41 @@ function makeCacheKey(mode: RenderMode, source: string): string {
     return 'ggb_' + Math.abs(hash).toString(36);
 }
 
+/** 根据缓存键生成文件路径 */
 function cachePath(key: string): string {
     return `${cacheDirPath}/${key}.html`;
 }
 
+/**
+ * 从缓存中读取内容。
+ * 优先尝试文件缓存（持久化），失败则回退到 localStorage。
+ */
 async function cacheGet(key: string): Promise<string | null> {
-    // Try file cache first
+    // 优先尝试文件缓存
     if (cacheVault) {
         try {
             const path = cachePath(key);
             const file = cacheVault.getFileByPath(path);
             if (file) return await cacheVault.read(file);
-        } catch { /* ignore */ }
+        } catch { /* 文件不存在或读取失败，忽略 */ }
     }
-    // Fallback to localStorage (works even in PDF export context)
+    // 回退到 localStorage（在 PDF 导出上下文中也能工作）
     try { return localStorage.getItem('ggb_' + key); } catch { return null; }
 }
 
+/**
+ * 将内容写入缓存。
+ * 同时写入文件缓存和 localStorage，确保双重备份。
+ */
 async function cacheSet(key: string, value: string): Promise<void> {
-    // Write to file
+    // 写入文件缓存
     if (cacheVault) {
         try {
             const path = cachePath(key);
-            // Ensure directory exists
+            // 确保目录存在
             const dir = path.substring(0, path.lastIndexOf('/'));
             if (!cacheVault.getAbstractFileByPath(dir)) {
-                try { await cacheVault.createFolder(dir); } catch { /* already exists */ }
+                try { await cacheVault.createFolder(dir); } catch { /* 目录已存在 */ }
             }
             try {
                 const existing = cacheVault.getFileByPath(path);
@@ -64,86 +93,118 @@ async function cacheSet(key: string, value: string): Promise<void> {
                     await cacheVault.create(path, value);
                 }
             } catch {
-                // Race: file created between check and create — try modify
+                // 竞态条件：在检查和创建之间文件可能被其他代码块创建，尝试修改
                 try {
                     const f = cacheVault.getFileByPath(path);
                     if (f) await cacheVault.modify(f, value);
-                } catch { /* ignore */ }
+                } catch { /* 忽略 */ }
             }
         } catch (e) {
             console.warn('[GeoGebra] File cache write failed:', e);
         }
     }
-    // Also save to localStorage as fallback
-    try { localStorage.setItem('ggb_' + key, value); } catch { /* ignore */ }
+    // 同时写入 localStorage 作为回退
+    try { localStorage.setItem('ggb_' + key, value); } catch { /* 忽略 */ }
 }
 
-/** Map RenderMode to GeoGebra app name */
+// ─── GeoGebra 引擎配置 ──────────────────────────────────────
+
+/**
+ * 渲染模式 → GeoGebra 应用名称的映射。
+ *
+ * - classic:  完整版 GeoGebra，支持所有几何命令（Segment, Locus, Slider 等）
+ * - 3d:       专用 3D 计算器，自带 3D 视图
+ * - graphing: 函数绘图计算器，仅支持函数定义，不支持几何命令
+ *
+ * 注意：如果需要 Segment/Locus/Point(path) 等几何命令，必须使用 classic 而非 graphing。
+ */
 const APP_NAMES: Record<RenderMode, string> = {
     [RenderMode.Geometry2D]: 'classic',
     [RenderMode.Geometry3D]: '3d',
     [RenderMode.Graph]: 'graphing',
 };
 
-/** Default perspectives for each mode */
+/**
+ * 各模式的默认视图布局（perspective）。
+ * 字符含义：A=代数面板, G=平面图形, T=3D视图, S=电子表格
+ */
 const DEFAULT_PERSPECTIVES: Record<RenderMode, string> = {
-    [RenderMode.Geometry2D]: 'AG',  // Algebra panel (left) + Graphics
-    [RenderMode.Geometry3D]: 'AT',  // Algebra panel (left) + 3D view
-    [RenderMode.Graph]: 'AG',      // Algebra panel (left) + Graphics
+    [RenderMode.Geometry2D]: 'AG',  // 代数面板 + 平面图形
+    [RenderMode.Geometry3D]: 'AT',  // 代数面板 + 3D 视图
+    [RenderMode.Graph]: 'AG',      // 代数面板 + 平面图形
 };
 
-/** Default heights for each mode */
+/** 各模式的默认画布高度（像素） */
 const DEFAULT_HEIGHTS: Record<RenderMode, number> = {
     [RenderMode.Geometry2D]: 500,
     [RenderMode.Geometry3D]: 750,
     [RenderMode.Graph]: 500,
 };
 
+/** 全局 applet 计数器，用于生成唯一 DOM ID */
 let appletCounter = 0;
 
-/** Wait for next animation frame (element has layout dimensions) */
+/**
+ * 等待浏览器下一帧渲染完成。
+ * 用于确保 DOM 元素已完成布局，可以正确测量宽高。
+ */
 function waitForLayout(): Promise<void> {
     return new Promise(resolve => requestAnimationFrame(() => resolve()));
 }
 
+// ─── 参数解析 ────────────────────────────────────────────────
+
 /**
- * Parsed parameters from code block frontmatter.
- * Lines starting with @ are treated as parameters:
- *   @height 600
- *   @width 800
- *   @perspective AG   (A=Algebra, G=Graphics, T=3D, S=Spreadsheet)
- *   @toolbar true
- *   @grid true
- *   @axes true
+ * 代码块参数接口。
+ * 用户通过 @key value 语法在代码块开头设置参数。
  */
 export interface AppletParams {
+    /** 画布宽度（像素），默认自适应容器宽度 */
     width?: number;
+    /** 画布高度（像素） */
     height?: number;
+    /** 视图布局字符串，如 'AG'（代数+图形）、'G'（仅图形）、'AT'（代数+3D） */
     perspective?: string;
+    /** 是否显示工具栏 */
     toolbar?: boolean;
+    /** 是否显示网格 */
     grid?: boolean;
+    /** 是否显示坐标轴 */
     axes?: boolean;
-    /** Hide the virtual keyboard button at bottom-left */
+    /** 是否显示虚拟键盘和代数输入框 */
     keyboard?: boolean;
-    /** Coordinate system bounds: [xMin, xMax, yMin, yMax] */
+    /** 坐标系精确范围：[xMin, xMax, yMin, yMax]，优先级高于 center/zoom */
     range?: [number, number, number, number];
-    /** Center point of the view: [x, y] for 2D or [x, y, z] for 3D */
+    /** 视图中心点坐标：2D 为 [x, y]，3D 为 [x, y, z] */
     center?: number[];
-    /** Zoom level (visible units from center): used with @center */
+    /** 缩放级别：从中心到各边界的可见单位数，配合 @center 使用 */
     zoom?: number;
-    /** Scale factor: scales everything (text, points, lines) proportionally. e.g. 0.6 = 60% */
+    /** 整体缩放比例（CSS transform），如 0.6 表示缩小到 60% */
     scale?: number;
 }
 
+/**
+ * 解析代码块源码，提取参数和命令。
+ *
+ * 源码格式：
+ *   @height 600       ← 参数行（@key value）
+ *   @grid true        ← 参数行
+ *   # 这是注释       ← 注释行（# 或 // 开头），被忽略
+ *   A = (1, 3)        ← GeoGebra 命令
+ *   B = (3, 4)        ← GeoGebra 命令
+ *
+ * @returns params: 解析后的参数对象；commands: GeoGebra 命令数组
+ */
 function parseSource(source: string): { params: AppletParams; commands: string[] } {
     const params: AppletParams = {};
     const commands: string[] = [];
 
     for (const raw of source.split('\n')) {
         const line = raw.trim();
+        // 跳过空行和注释行
         if (!line || line.startsWith('#') || line.startsWith('//')) continue;
 
-        // Parse @key value parameters
+        // 匹配 @key value 格式的参数行
         const paramMatch = line.match(/^@(\w+)\s+(.+)$/);
         if (paramMatch) {
             const key = paramMatch[1].toLowerCase();
@@ -171,7 +232,7 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
                     params.keyboard = val.toLowerCase() === 'true' || val === '1';
                     break;
                 case 'center': {
-                    // @center x,y  or  @center x,y,z  for 3D
+                    // @center x,y 或 @center x,y,z（3D 模式）
                     const parts = val.split(/[,\s]+/).map(Number);
                     if (parts.length >= 2 && parts.every(n => !isNaN(n))) {
                         params.center = parts.slice(0, parts.length >= 3 ? 3 : 2);
@@ -179,15 +240,13 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
                     break;
                 }
                 case 'zoom':
-                    // @zoom 10  — visible units from center in each direction
                     params.zoom = parseFloat(val);
                     break;
                 case 'scale':
-                    // @scale 0.6  — scale everything (text, lines, points) to 60%
                     params.scale = parseFloat(val);
                     break;
                 case 'range': {
-                    // @range xMin,xMax,yMin,yMax  e.g. @range -10,10,-5,5
+                    // @range xMin,xMax,yMin,yMax（逗号或空格分隔）
                     const r = val.split(/[,\s]+/).map(Number);
                     if (r.length >= 4 && r.every(n => !isNaN(n))) {
                         params.range = [r[0], r[1], r[2], r[3]];
@@ -198,19 +257,38 @@ function parseSource(source: string): { params: AppletParams; commands: string[]
             continue;
         }
 
+        // 非参数行视为 GeoGebra 命令
         commands.push(line);
     }
 
     return { params, commands };
 }
 
-/**
- * Render a GeoGebra code block into the given container.
- */
+// ─── 渲染主流程 ──────────────────────────────────────────────
+
+/** applet 加载完成后的回调接口 */
 export interface AppletCallbacks {
+    /** 当 applet 初始状态保存完毕时调用，传入重置函数 */
     onResetReady?: (resetFn: () => void) => void;
 }
 
+/**
+ * 渲染 GeoGebra 代码块的主函数。
+ *
+ * 完整流程：
+ * 1. 创建 DOM 结构（导出容器 + applet 容器 + 加载提示）
+ * 2. 尝试从缓存加载 PNG（用于 PDF 导出的快速显示）
+ * 3. 加载 GeoGebra JS SDK（deployggb.js）
+ * 4. 测量容器尺寸，计算缩放参数
+ * 5. 创建 GGBApplet 实例并注入 DOM
+ * 6. applet 就绪后：执行命令 → 调整视图 → 保存初始状态 → 生成 PNG 快照
+ * 7. 注册交互监听器，用户操作后自动更新 PNG 快照
+ *
+ * @param container  目标 DOM 容器
+ * @param source     代码块原始文本
+ * @param mode       渲染模式（2d / 3d / graph）
+ * @param callbacks  回调函数（重置按钮就绪等）
+ */
 export async function renderGeoGebra(
     container: HTMLElement,
     source: string,
@@ -220,39 +298,43 @@ export async function renderGeoGebra(
     const { onResetReady } = callbacks || {};
     const ck = makeCacheKey(mode, source);
 
-    // Static export container for PDF export (inline SVG / img)
-    // Created FIRST so cached content appears immediately
+    // ── 步骤 1：创建 DOM 结构 ──
+
+    // 导出容器：用于存放 PDF 导出的静态 PNG 图片。
+    // 屏幕上默认隐藏（display: none），仅在 @media print 和缓存回退时显示。
     const exportDiv = container.createDiv({ cls: 'ggb-export-container' });
 
-    // Check cache — if we have a previous render, inject immediately.
-    // This is critical for Obsidian's PDF export which re-renders markdown
-    // and won't wait for GeoGebra to load from CDN.
+    // ── 步骤 2：检查缓存 ──
+    // PDF 导出时 Obsidian 会重新渲染 markdown 但不等 GeoGebra 加载完成，
+    // 此时缓存的 PNG 图片可以立即显示在导出容器中。
     let hasCachedContent = false;
     const cached = await cacheGet(ck);
     if (cached) {
         exportDiv.innerHTML = cached;
-        exportDiv.classList.add('ggb-export-active');
+        exportDiv.classList.add('ggb-export-active'); // 激活导出容器显示
         hasCachedContent = true;
         console.log(`[GeoGebra] Cache hit: ${ck} (${cached.length} chars)`);
     }
 
+    // 生成唯一 applet ID（时间戳 + 计数器）
     const appletId = `ggb-applet-${Date.now()}-${++appletCounter}`;
+    // applet 容器：GeoGebra 将在此 div 内渲染交互式图形
     const appletDiv = container.createDiv({ cls: 'ggb-applet-container' });
     appletDiv.id = appletId;
 
-    // Show loading state — but hide it if we already have cached content
-    // (during PDF export, we don't want "Loading..." to appear)
+    // 加载提示：如果有缓存内容则隐藏（避免 PDF 导出时显示 "Loading..."）
     const loadingEl = container.createDiv({ cls: 'ggb-loading' });
     loadingEl.setText('Loading GeoGebra...');
     if (hasCachedContent) {
         loadingEl.style.display = 'none';
     }
 
-    // Parse parameters and commands from source
+    // 解析用户参数和 GeoGebra 命令
     const { params: userParams, commands } = parseSource(source);
     console.log(`[GeoGebra] Rendering ${mode} applet (${APP_NAMES[mode]}) with ${commands.length} commands, params:`, userParams);
 
-    // Capture any unhandled errors during GeoGebra initialization
+    // ── 步骤 3：错误捕获 ──
+    // 监听 GeoGebra 初始化过程中的未捕获错误（来自 web3d、geogebra 脚本）
     const errorCapture: string[] = [];
     const errorHandler = (event: ErrorEvent) => {
         if (event.filename?.includes('web3d') || event.filename?.includes('geogebra') || event.filename?.includes('VM')) {
@@ -263,6 +345,7 @@ export async function renderGeoGebra(
     window.addEventListener('error', errorHandler);
 
     try {
+        // ── 步骤 4：加载 GeoGebra SDK ──
         await loadGeoGebra();
 
         if (typeof GGBApplet === 'undefined') {
@@ -271,23 +354,26 @@ export async function renderGeoGebra(
 
         loadingEl.setText('Initializing applet...');
 
-        // Wait for DOM layout so we can measure the actual container width
+        // 等待两帧以确保 DOM 布局完成，能正确测量容器宽度
         await waitForLayout();
         await waitForLayout();
 
+        // ── 步骤 5：计算尺寸和缩放 ──
+
+        // 测量容器实际宽度，取 appletDiv 或 container 中较大的值，最小 400px
         const measuredWidth = appletDiv.clientWidth || appletDiv.offsetWidth
             || container.clientWidth || container.offsetWidth || 800;
         const scale = userParams.scale || 1;
-        // GeoGebra renders at full (unscaled) size; CSS transform handles scaling
+
+        // GeoGebra 按原始尺寸渲染，缩放通过 CSS transform 实现
         const width = userParams.width || Math.max(measuredWidth, 400);
         const height = userParams.height || DEFAULT_HEIGHTS[mode];
-        // Visual size after CSS transform
+        // 缩放后的视觉尺寸
         const visualWidth = Math.round(width * scale);
         const visualHeight = Math.round(height * scale);
 
-        // Constrain container to visual (scaled) size immediately — this
-        // ensures PDF re-render (cache path) also respects the scale.
-        // Only the CSS transform is deferred until applet actually loads.
+        // 如果需要缩放，立即限制容器尺寸（防止溢出）
+        // CSS transform 会在 applet 加载后应用
         if (scale !== 1) {
             container.style.maxWidth = `${visualWidth}px`;
             container.style.height = `${visualHeight}px`;
@@ -296,8 +382,7 @@ export async function renderGeoGebra(
             appletDiv.style.minHeight = `${userParams.height}px`;
         }
 
-        // CSS transform applied after applet loads (deferred to avoid
-        // polluting DOM during PDF re-render when cache is used)
+        // 延迟应用 CSS transform（避免在 PDF 导出的缓存路径中污染 DOM）
         const applyScale = () => {
             if (scale !== 1) {
                 appletDiv.style.transformOrigin = 'top left';
@@ -309,24 +394,26 @@ export async function renderGeoGebra(
 
         console.log(`[GeoGebra] Size: render ${width}x${height}, scale ${scale}, visual ${visualWidth}x${visualHeight}`);
 
+        // ── 步骤 6：创建 applet 并等待加载 ──
+
         await new Promise<void>((resolve, reject) => {
-            // Shorter timeout when cache is available (just for live upgrade attempt)
+            // 有缓存时超时更短（15s），因为缓存已经可以用于 PDF 导出
+            // 无缓存时给 60s 等待 CDN 加载
             const timeoutMs = hasCachedContent ? 15000 : 60000;
             const timeout = setTimeout(() => {
                 window.removeEventListener('error', errorHandler);
                 if (hasCachedContent) {
-                    // Cache available — silently give up on live applet
+                    // 有缓存 → 静默放弃实时 applet，使用缓存的 PNG
                     console.log(`[GeoGebra] Live applet timed out but cache available, using cached content`);
-                    // Clean up partially loaded applet DOM to avoid PDF renderer issues
                     appletDiv.innerHTML = '';
                     appletDiv.style.display = 'none';
                     loadingEl.remove();
                     container.classList.add('ggb-cache-only');
-                    // Release fixed height so cached image uses its natural size
                     container.style.height = '';
                     container.style.overflow = '';
                     resolve();
                 } else {
+                    // 无缓存 → 报错
                     const errMsg = errorCapture.length > 0
                         ? `GeoGebra errors:\n${errorCapture.join('\n')}`
                         : 'GeoGebra applet initialization timed out (60s). Check console for details.';
@@ -337,41 +424,46 @@ export async function renderGeoGebra(
             const perspective = userParams.perspective || DEFAULT_PERSPECTIVES[mode];
             const showToolBar = userParams.toolbar ?? false;
 
+            // GGBApplet 构造参数
+            // 完整参数文档：https://wiki.geogebra.org/en/Reference:GeoGebra_App_Parameters
             const params: Record<string, any> = {
                 id: appletId,
-                appName: APP_NAMES[mode],
+                appName: APP_NAMES[mode],        // 应用类型：classic / 3d / graphing
                 width,
                 height,
-                perspective,
+                perspective,                     // 视图布局
                 scaleContainerClass: 'ggb-applet-container',
-                showAlgebraInput: userParams.keyboard ?? true,
-                showKeyboardOnFocus: userParams.keyboard ?? true,
+                showAlgebraInput: userParams.keyboard ?? true,   // 代数输入框
+                showKeyboardOnFocus: userParams.keyboard ?? true, // 聚焦时弹出虚拟键盘
                 algebraInputPosition: 'algebra',
                 showToolBar,
                 showToolBarHelp: false,
                 showMenuBar: false,
                 showResetIcon: false,
-                enableLabelDrags: true,
-                enableShiftDragZoom: true,
-                enableRightClick: true,
-                enableCAS: false,
-                enableAnimation: true,
+                enableLabelDrags: true,          // 允许拖拽标签
+                enableShiftDragZoom: true,       // 允许 Shift+拖拽缩放
+                enableRightClick: true,          // 允许右键菜单
+                enableCAS: false,                // 禁用 CAS（计算机代数系统）
+                enableAnimation: true,           // 启用动画功能
                 allowStyleBar: false,
-                errorDialogsActive: false,
+                errorDialogsActive: false,       // 禁用错误弹窗
                 useBrowserForJS: false,
-                preventFocus: true,
+                preventFocus: true,              // 防止自动获取焦点
+
+                // ── applet 加载完成回调 ──
+                // GeoGebra SDK 在 applet 完全初始化后调用此函数
                 appletOnLoad: (api: any) => {
                     clearTimeout(timeout);
                     window.removeEventListener('error', errorHandler);
                     console.log(`[GeoGebra] Applet ${appletId} ready, executing ${commands.length} commands...`);
                     loadingEl.remove();
 
-                    // Live applet loaded — hide cached export, show applet
+                    // 实时 applet 已加载 → 隐藏缓存导出容器，显示 applet
                     exportDiv.classList.remove('ggb-export-active');
                     appletDiv.style.display = '';
                     applyScale();
 
-                    // Apply grid/axes settings before commands
+                    // 在执行命令之前应用网格/坐标轴设置
                     if (userParams.grid !== undefined) {
                         api.setGridVisible(userParams.grid);
                     }
@@ -379,42 +471,52 @@ export async function renderGeoGebra(
                         api.setAxesVisible(userParams.axes, userParams.axes);
                     }
 
+                    // 执行所有 GeoGebra 命令
                     executeCommands(api, commands);
 
-                    // Apply coordinate system settings after commands
-                    // 3D needs longer delay for the 3D view to fully initialize
+                    // ── 视图调整 ──
+                    // 命令执行完毕后调整坐标系，3D 模式需要更长的延迟等待视图初始化
                     const viewDelay = mode === RenderMode.Geometry3D ? 800 : 300;
+
+                    /**
+                     * 应用 3D 视图坐标系设置。
+                     * 同时使用 evalCommand 和 JS API 两种方式，增加兼容性。
+                     */
                     const apply3DView = (api: any, cx: number, cy: number, cz: number, z: number) => {
-                        api.evalCommand('SetActiveView(2)');
+                        api.evalCommand('SetActiveView(2)');  // 2 = 3D 视图
                         const cmd = `SetCoordSystem(${cx - z}, ${cx + z}, ${cy - z}, ${cy + z}, ${cz - z}, ${cz + z})`;
                         api.evalCommand(cmd);
                         console.log(`[GeoGebra] 3D SetCoordSystem: ${cmd}`);
-                        // Also try JS API as fallback
+                        // JS API 作为回退方案
                         try {
                             api.setCoordSystem(cx - z, cx + z, cy - z, cy + z, cz - z, cz + z);
-                        } catch (_) { /* ignore */ }
+                        } catch (_) { /* 忽略 */ }
                     };
+
                     setTimeout(() => {
                         try {
                             if (mode === RenderMode.Geometry3D) {
-                                // ── 3D view adjustment ──
+                                // ── 3D 视图调整 ──
                                 if (userParams.center || userParams.zoom) {
+                                    // 使用 @center 和 @zoom 设置 3D 视图范围
                                     const cx = userParams.center?.[0] ?? 0;
                                     const cy = userParams.center?.[1] ?? 0;
                                     const cz = userParams.center?.[2] ?? 0;
                                     const z = userParams.zoom || 15;
                                     apply3DView(api, cx, cy, cz, z);
-                                    // Retry after another delay to ensure 3D view is ready
+                                    // 3D 视图初始化较慢，1 秒后重试确保生效
                                     setTimeout(() => {
                                         try { apply3DView(api, cx, cy, cz, z); } catch (_) {}
                                     }, 1000);
                                 } else if (userParams.range) {
+                                    // 使用 @range 精确设置 3D 坐标范围
                                     api.evalCommand('SetActiveView(2)');
                                     const [x0, x1, y0, y1] = userParams.range;
+                                    // z 轴范围取 x 轴范围的值
                                     api.evalCommand(`SetCoordSystem(${x0}, ${x1}, ${y0}, ${y1}, ${x0}, ${x1})`);
                                     console.log(`[GeoGebra] 3D range set from @range`);
                                 } else {
-                                    // Auto-fit
+                                    // 无参数时自动适配所有对象
                                     api.evalCommand('SetActiveView(2)');
                                     try {
                                         api.evalCommand('SelectAll()');
@@ -423,18 +525,18 @@ export async function renderGeoGebra(
                                     } catch {}
                                 }
                             } else if (userParams.range) {
-                                // ── 2D explicit range ──
+                                // ── 2D 精确坐标范围 ──
                                 const [xMin, xMax, yMin, yMax] = userParams.range;
                                 api.setCoordSystem(xMin, xMax, yMin, yMax);
                                 console.log(`[GeoGebra] 2D range: [${xMin}, ${xMax}, ${yMin}, ${yMax}]`);
                             } else if (userParams.center) {
-                                // ── 2D center + zoom ──
+                                // ── 2D 中心点 + 缩放 ──
                                 const [cx, cy] = userParams.center;
                                 const z = userParams.zoom || 10;
                                 api.setCoordSystem(cx - z, cx + z, cy - z, cy + z);
                                 console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z}`);
                             } else {
-                                // ── Auto-fit ──
+                                // ── 自动适配 ──
                                 try {
                                     api.evalCommand('SelectAll()');
                                     api.evalCommand('ZoomToFit()');
@@ -447,17 +549,19 @@ export async function renderGeoGebra(
                         }
                     }, viewDelay);
 
-                    // Save initial state for reset (after auto-center settles)
-                    // For 3D with center/zoom, wait longer due to retry
+                    // ── 保存初始状态（用于重置按钮） ──
+                    // 3D + center/zoom 需要更长延迟（等待重试完成）
                     const saveDelay = (mode === RenderMode.Geometry3D && (userParams.center || userParams.zoom)) ? 2500 : 800;
                     setTimeout(() => {
                         try {
+                            // 通过 getBase64() 保存完整的 applet 状态（XML + 构造数据）
                             const savedState = api.getBase64();
                             console.log(`[GeoGebra] Initial state saved (${savedState.length} chars)`);
                             if (onResetReady) {
+                                // 通知 main.ts 重置函数已就绪，启用重置按钮
                                 onResetReady(() => {
                                     console.log(`[GeoGebra] Restoring initial state...`);
-                                    api.setBase64(savedState);
+                                    api.setBase64(savedState); // 恢复到保存的状态
                                 });
                             }
                         } catch (e) {
@@ -465,23 +569,25 @@ export async function renderGeoGebra(
                         }
                     }, saveDelay);
 
-                    // ── Export static snapshot for PDF (inline SVG / PNG) ──
+                    // ── 生成 PDF 导出用的 PNG 快照 ──
+
+                    /** 将当前导出容器的内容写入缓存 */
                     const saveExportToCache = () => {
                         if (exportDiv.innerHTML.length > 100) {
                             cacheSet(ck, exportDiv.innerHTML);
                         }
                     };
 
-                    // Always use PNG for cache — SVG can crash Electron's PDF renderer
-                    const injectExportContent = () => {
-                        injectPNGFallback();
-                    };
-
-                    // Build img tag with explicit visual width baked in
+                    /** 生成 <img> 标签，内嵌 base64 PNG，附带缩放后的视觉宽度 */
                     const mkImg = (b64: string) =>
                         `<img src="data:image/png;base64,${b64}" class="ggb-export-img" style="width:${visualWidth}px;max-width:100%;height:auto;" alt="GeoGebra ${mode}">`;
 
+                    /**
+                     * 截取当前 applet 的 PNG 快照并注入到导出容器中。
+                     * 优先使用 getPNGBase64（同步、高质量），失败则回退到 getScreenshotBase64（异步）。
+                     */
                     const injectPNGFallback = () => {
+                        // 方案 1：同步 PNG 导出（2x 缩放，144 DPI）
                         try {
                             const b64 = api.getPNGBase64(2, false, 144);
                             if (b64 && b64.length > 100) {
@@ -490,7 +596,8 @@ export async function renderGeoGebra(
                                 console.log(`[GeoGebra] PNG export cached (visual ${visualWidth}px)`);
                                 return;
                             }
-                        } catch { /* ignore */ }
+                        } catch { /* 忽略 */ }
+                        // 方案 2：异步截图回退
                         try {
                             api.getScreenshotBase64((b64: string) => {
                                 if (b64 && b64.length > 100) {
@@ -499,43 +606,48 @@ export async function renderGeoGebra(
                                     console.log(`[GeoGebra] Screenshot export cached`);
                                 }
                             });
-                        } catch { /* ignore */ }
+                        } catch { /* 忽略 */ }
                     };
 
-                    // Inject after view adjustments settle
-                    setTimeout(injectExportContent, saveDelay + 1000);
-                    setTimeout(injectExportContent, saveDelay + 4000);
+                    // 在视图调整稳定后截取快照（两次，确保质量）
+                    setTimeout(injectPNGFallback, saveDelay + 1000);
+                    setTimeout(injectPNGFallback, saveDelay + 4000);
 
-                    // Auto-refresh cache when user interacts
+                    // ── 交互监听：用户操作后自动更新 PNG 快照 ──
+
                     let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+                    /** 防抖刷新：600ms 内多次触发只执行一次 */
                     const debouncedRefresh = () => {
                         if (refreshTimer) clearTimeout(refreshTimer);
-                        refreshTimer = setTimeout(injectExportContent, 600);
+                        refreshTimer = setTimeout(injectPNGFallback, 600);
                     };
+
                     try {
-                        // Object changes (drag points, sliders, etc.)
+                        // 监听对象变化（拖拽点、调整滑块等）
                         api.registerUpdateListener(debouncedRefresh);
-                    } catch { /* ignore */ }
+                    } catch { /* 忽略 */ }
                     try {
-                        // View changes (pan, zoom, rotate, resize, etc.)
-                        // Trigger on most events except very high-frequency ones
+                        // 监听视图变化（平移、缩放、旋转等）
+                        // 过滤掉高频事件以避免性能问题
                         api.registerClientListener((evt: any) => {
                             const t = evt?.type || evt;
                             if (typeof t !== 'string') return;
-                            // Skip high-frequency mouse-move events
+                            // 跳过高频鼠标事件和样式更新事件
                             if (/^(mouseDown|updateStyle|editorStart|editorKeyTyped|showStyleBar)$/i.test(t)) return;
                             debouncedRefresh();
                         });
-                    } catch { /* ignore */ }
+                    } catch { /* 忽略 */ }
 
                     resolve();
                 },
             };
 
+            // 创建 GGBApplet 实例并注入 DOM
             try {
                 console.log(`[GeoGebra] Creating GGBApplet(appName="${APP_NAMES[mode]}", ${width}x${height})...`);
-                const applet = new GGBApplet(params, true);
+                const applet = new GGBApplet(params, true); // true = HTML5 only
 
+                // 设置 GeoGebra CDN codebase（确保资源从正确版本加载）
                 const ver = getGeoGebraVersion();
                 if (ver) {
                     const codebase = `https://www.geogebra.org/apps/${ver}/web3d/`;
@@ -543,6 +655,7 @@ export async function renderGeoGebra(
                     applet.setHTML5Codebase(codebase);
                 }
 
+                // 注入到 DOM，GeoGebra 将异步加载并最终触发 appletOnLoad 回调
                 console.log(`[GeoGebra] Injecting into #${appletId}...`);
                 applet.inject(appletId);
                 console.log(`[GeoGebra] inject() called, waiting for appletOnLoad callback...`);
@@ -554,21 +667,21 @@ export async function renderGeoGebra(
         });
 
     } catch (e) {
+        // ── 渲染失败处理 ──
         window.removeEventListener('error', errorHandler);
         loadingEl.remove();
         console.error('[GeoGebra] Render failed:', e);
 
-        // If we have cached export content, show it instead of error
-        // (this happens during Obsidian's PDF export re-render)
         if (exportDiv.innerHTML.length > 100) {
+            // 有缓存 → 降级显示缓存的 PNG（常见于 PDF 导出场景）
             console.log(`[GeoGebra] Render failed but cache available — showing cached content`);
             appletDiv.style.display = 'none';
             exportDiv.classList.add('ggb-export-active');
             container.classList.add('ggb-cache-only');
-            // Release fixed height so cached image uses its natural size
             container.style.height = '';
             container.style.overflow = '';
         } else {
+            // 无缓存 → 显示错误信息
             const msg = (e as Error).message || String(e);
             container.createDiv({
                 cls: 'geogebra-error',
@@ -578,49 +691,70 @@ export async function renderGeoGebra(
     }
 }
 
+// ─── API 命令处理器 ──────────────────────────────────────────
+// 部分命令需要通过 GeoGebra JS API 直接调用（而非 evalCommand），
+// 例如 SetAnimating、SetColor 等。这里为每个支持的 API 命令定义处理器。
+
+/**
+ * API 命令 → 处理函数的映射表。
+ * 命令格式：CommandName(arg1, arg2, ...)
+ * 如果代码块中的命令匹配到此表中的命令名，则使用对应的 JS API 而非 evalCommand。
+ */
 const API_COMMAND_HANDLERS: Record<string, (api: any, args: string[]) => void> = {
+    /** 设置对象动画状态 */
     'SetAnimating': (api, args) => {
         const name = args[0]?.trim();
         const anim = args[1]?.trim().toLowerCase() !== 'false';
         if (name) api.setAnimating(name, anim);
     },
+    /** 开始全局动画 */
     'StartAnimation': (api) => { api.startAnimation(); },
+    /** 停止全局动画 */
     'StopAnimation': (api) => { api.stopAnimation(); },
+    /** 设置动画速度 */
     'SetAnimationSpeed': (api, args) => {
         const name = args[0]?.trim();
         const speed = parseFloat(args[1]?.trim());
         if (name && !isNaN(speed)) api.setAnimationSpeed(name, speed);
     },
+    /** 设置对象颜色（RGB） */
     'SetColor': (api, args) => {
         const name = args[0]?.trim();
         const r = parseInt(args[1]?.trim()), g = parseInt(args[2]?.trim()), b = parseInt(args[3]?.trim());
         if (name) api.setColor(name, r, g, b);
     },
+    /** 设置对象可见性 */
     'SetVisible': (api, args) => {
         const name = args[0]?.trim();
         const vis = args[1]?.trim().toLowerCase() !== 'false';
         if (name) api.setVisible(name, vis);
     },
+    /** 固定/解锁对象（固定后不可拖拽） */
     'SetFixed': (api, args) => {
         const name = args[0]?.trim();
         const fixed = args[1]?.trim().toLowerCase() !== 'false';
         if (name) api.setFixed(name, fixed);
     },
+    /** 设置线条粗细 */
     'SetLineThickness': (api, args) => {
         const name = args[0]?.trim();
         const t = parseInt(args[1]?.trim());
         if (name && !isNaN(t)) api.setLineThickness(name, t);
     },
+    /** 设置点的大小 */
     'SetPointSize': (api, args) => {
         const name = args[0]?.trim();
         const s = parseInt(args[1]?.trim());
         if (name && !isNaN(s)) api.setPointSize(name, s);
     },
+    /** 设置对象标题文字 */
     'SetCaption': (api, args) => {
         const name = args[0]?.trim();
+        // 标题可能包含逗号，所以将除第一个参数外的所有部分重新拼接
         const caption = args.slice(1).join(',').trim().replace(/^["']|["']$/g, '');
         if (name) api.setCaption(name, caption);
     },
+    /** 显示/隐藏对象标签 */
     'SetLabelVisible': (api, args) => {
         const name = args[0]?.trim();
         const vis = args[1]?.trim().toLowerCase() !== 'false';
@@ -628,7 +762,14 @@ const API_COMMAND_HANDLERS: Record<string, (api: any, args: string[]) => void> =
     },
 };
 
+/**
+ * 尝试将命令作为 API 调用执行。
+ * 如果命令匹配 API_COMMAND_HANDLERS 中的命令名，则通过 JS API 调用。
+ *
+ * @returns true 如果命令被识别并执行；false 如果不是 API 命令
+ */
 function tryApiCommand(api: any, cmd: string): boolean {
+    // 匹配 CommandName(args) 格式
     const match = cmd.match(/^(\w+)\s*\((.*)\)\s*$/);
     if (!match) return false;
     const handler = API_COMMAND_HANDLERS[match[1]];
@@ -643,17 +784,31 @@ function tryApiCommand(api: any, cmd: string): boolean {
     return true;
 }
 
+/**
+ * 执行所有 GeoGebra 命令。
+ *
+ * 处理流程：
+ * 1. 禁用 GeoGebra 的错误弹窗（避免干扰用户）
+ * 2. 逐条执行命令：先尝试作为 API 命令，失败则使用 evalCommand
+ * 3. 延迟重新执行动画命令（确保对象已完全创建后再启动动画）
+ * 4. 自动为函数对象显示标签（如 "f(x) = sin(x)"）
+ *
+ * 注意：evalCommand 的返回值不可靠（对 Segment、Locus 等几何命令会返回 false
+ * 即使命令实际执行成功），因此不检查返回值。
+ */
 function executeCommands(api: any, commands: string[]): void {
     try {
         api.setErrorDialogsActive(false);
+
         for (const cmd of commands) {
+            // 优先尝试 API 命令（SetAnimating, SetColor 等）
             if (tryApiCommand(api, cmd)) continue;
+            // 普通 GeoGebra 构造命令通过 evalCommand 执行
             console.log(`[GeoGebra] evalCommand: ${cmd}`);
-            const success = api.evalCommand(cmd);
-            if (!success) {
-                console.warn(`[GeoGebra] Command may have failed: ${cmd}`);
-            }
+            api.evalCommand(cmd);
         }
+
+        // 动画命令需要延迟执行：确保滑块等对象已完全创建
         const animCmds = commands.filter(cmd => {
             const m = cmd.match(/^(\w+)\s*\(/);
             return m && ['SetAnimating', 'StartAnimation', 'SetAnimationSpeed', 'StopAnimation'].includes(m[1]);
@@ -664,23 +819,20 @@ function executeCommands(api: any, commands: string[]): void {
                 console.log(`[GeoGebra] Animation commands applied`);
             }, 300);
         }
+
         console.log(`[GeoGebra] All ${commands.length} commands executed`);
 
-        // Auto-show function expressions as labels
-        // Label styles: 0=NAME, 1=NAME_VALUE, 2=VALUE, 3=CAPTION
+        // 自动为函数对象显示标签（如 "f(x) = sin(x)"）
+        // 标签样式：0=仅名称, 1=名称+值, 2=仅值, 3=标题
         try {
             const allNames = api.getAllObjectNames() || [];
             for (const name of allNames) {
-                const objType = api.getObjectType(name);
-                if (objType === 'function' || objType === 'line' && name.match(/^[a-z]$/)) {
-                    // Only for function objects (f, g, h, etc.)
-                    if (objType === 'function') {
-                        api.setLabelVisible(name, true);
-                        api.setLabelStyle(name, 1); // NAME_VALUE: "f(x) = sin(x)"
-                    }
+                if (api.getObjectType(name) === 'function') {
+                    api.setLabelVisible(name, true);
+                    api.setLabelStyle(name, 1); // NAME_VALUE 样式
                 }
             }
-        } catch { /* ignore */ }
+        } catch { /* 忽略 */ }
     } catch (e) {
         console.error('[GeoGebra] Error executing commands:', e);
     }
