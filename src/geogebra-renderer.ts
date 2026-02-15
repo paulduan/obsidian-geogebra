@@ -597,6 +597,12 @@ export async function renderGeoGebra(
                         createSliderOverlay(api, commands, container);
                     }
 
+                    // ── 自动标记函数交点 ──
+                    // 2D/Graph 模式下，自动计算所有函数对的交点并标记为可点击的红色点
+                    if (mode !== RenderMode.Geometry3D) {
+                        addIntersectionPoints(api);
+                    }
+
                     // 3D 模式下默认线条较粗，自动调细（除非用户已通过 SetLineThickness 自定义）
                     if (mode === RenderMode.Geometry3D) {
                         try {
@@ -1049,11 +1055,29 @@ const API_COMMAND_HANDLERS: Record<string, (api: any, args: string[]) => void> =
         const speed = parseFloat(args[1]?.trim());
         if (name && !isNaN(speed)) api.setAnimationSpeed(name, speed);
     },
-    /** 设置对象颜色（RGB） */
+    /** 设置对象颜色（支持 RGB 数字或颜色名称） */
     'SetColor': (api, args) => {
         const name = args[0]?.trim();
-        const r = parseInt(args[1]?.trim()), g = parseInt(args[2]?.trim()), b = parseInt(args[3]?.trim());
-        if (name) api.setColor(name, r, g, b);
+        if (!name) return;
+        // 常用颜色名 → RGB 映射
+        const COLOR_MAP: Record<string, [number, number, number]> = {
+            'red': [255, 0, 0], 'green': [0, 128, 0], 'blue': [0, 0, 255],
+            'yellow': [255, 255, 0], 'orange': [255, 165, 0], 'purple': [128, 0, 128],
+            'cyan': [0, 255, 255], 'magenta': [255, 0, 255], 'black': [0, 0, 0],
+            'white': [255, 255, 255], 'gray': [128, 128, 128], 'grey': [128, 128, 128],
+            'pink': [255, 192, 203], 'brown': [139, 69, 19], 'darkred': [139, 0, 0],
+            'darkblue': [0, 0, 139], 'darkgreen': [0, 100, 0], 'lightblue': [173, 216, 230],
+            'lightgreen': [144, 238, 144], 'gold': [255, 215, 0], 'maroon': [128, 0, 0],
+        };
+        const colorName = args[1]?.trim().replace(/^["']|["']$/g, '').toLowerCase();
+        const mapped = COLOR_MAP[colorName];
+        if (mapped) {
+            api.setColor(name, mapped[0], mapped[1], mapped[2]);
+        } else {
+            // 尝试解析为 RGB 数字
+            const r = parseInt(args[1]?.trim()), g = parseInt(args[2]?.trim()), b = parseInt(args[3]?.trim());
+            if (!isNaN(r) && !isNaN(g) && !isNaN(b)) api.setColor(name, r, g, b);
+        }
     },
     /** 设置对象可见性 */
     'SetVisible': (api, args) => {
@@ -1085,6 +1109,15 @@ const API_COMMAND_HANDLERS: Record<string, (api: any, args: string[]) => void> =
         // 标题可能包含逗号，所以将除第一个参数外的所有部分重新拼接
         const caption = args.slice(1).join(',').trim().replace(/^["']|["']$/g, '');
         if (name) api.setCaption(name, caption);
+    },
+    // 注意：GeoGebra 没有 SetTextSize API。文本字号/颜色请在 Text() 中使用 LaTeX：
+    // Text("\textcolor{red}{\Large 内容 = " + var + "}", (x, y), true, true)
+    // LaTeX 字号：\tiny, \small, \normalsize, \large, \Large, \LARGE, \huge, \Huge
+    /** 设置填充透明度（0~1） */
+    'SetFilling': (api, args) => {
+        const name = args[0]?.trim();
+        const fill = parseFloat(args[1]?.trim());
+        if (name && !isNaN(fill)) api.setFilling(name, fill);
     },
     /** 显示/隐藏对象标签 */
     'SetLabelVisible': (api, args) => {
@@ -1160,7 +1193,7 @@ function executeCommands(api: any, commands: string[]): void {
         try {
             const allNames = api.getAllObjectNames() || [];
             // 不需要显示标签的辅助对象类型
-            const silentTypes = new Set(['numeric', 'boolean', 'slider', 'list', 'image']);
+            const silentTypes = new Set(['numeric', 'boolean', 'slider', 'list', 'image', 'text']);
             for (const name of allNames) {
                 const objType = (api.getObjectType(name) || '').toLowerCase();
                 if (silentTypes.has(objType)) continue;
@@ -1243,4 +1276,110 @@ function createSliderOverlay(api: any, commands: string[], container: HTMLElemen
 
     container.appendChild(overlay);
     console.log(`[GeoGebra] Created ${sliders.length} slider overlay(s)`);
+}
+
+/**
+ * 自动计算所有函数对的交点并标记。
+ *
+ * 遍历所有函数对象，对每一对调用 GeoGebra 的 Intersect() 命令，
+ * 生成的交点设置为红色大点，显示坐标标签，可点击拖拽。
+ */
+/**
+ * 自动计算所有函数对的交点，初始隐藏。
+ * 点击函数曲线时显示该函数的所有交点（含坐标标签），再次点击隐藏。
+ *
+ * 实现流程：
+ * 1. 遍历函数对，逐对调用 Intersect() 计算交点
+ * 2. 记录每个函数关联的交点名称
+ * 3. 所有交点初始 setVisible(false)
+ * 4. 注册 registerClickListener，点击函数时切换其交点显隐
+ */
+function addIntersectionPoints(api: any): void {
+    try {
+        const allNames = api.getAllObjectNames() || [];
+        const funcNames = allNames.filter((n: string) => api.getObjectType(n) === 'function');
+
+        if (funcNames.length < 2) return;
+
+        // funcName → 关联的交点名称列表
+        const funcPoints: Record<string, string[]> = {};
+        for (const f of funcNames) funcPoints[f] = [];
+
+        // 逐对计算交点，跟踪新增的点对象
+        for (let i = 0; i < funcNames.length; i++) {
+            for (let j = i + 1; j < funcNames.length; j++) {
+                const beforeNames = new Set(api.getAllObjectNames() || []);
+                try {
+                    api.evalCommand(`Intersect(${funcNames[i]}, ${funcNames[j]})`);
+                } catch { continue; }
+
+                const afterNames = api.getAllObjectNames() || [];
+                for (const name of afterNames) {
+                    if (beforeNames.has(name)) continue;
+                    if (api.getObjectType(name) !== 'point') continue;
+
+                    // 此交点属于两个函数
+                    funcPoints[funcNames[i]].push(name);
+                    funcPoints[funcNames[j]].push(name);
+
+                    // 样式：红色大点 + 坐标标签，初始隐藏
+                    api.setPointSize(name, 5);
+                    api.setColor(name, 220, 50, 50);
+                    api.setLabelStyle(name, 2);       // VALUE 样式 (x, y)
+                    api.setLabelVisible(name, false);
+                    api.setVisible(name, false);
+                }
+            }
+        }
+
+        const totalPoints = new Set(Object.values(funcPoints).flat()).size;
+        if (totalPoints === 0) return;
+
+        // 当前激活的函数名（null = 无激活）
+        let activeFunc: string | null = null;
+
+        // 隐藏指定函数的所有交点
+        const hidePoints = (funcName: string) => {
+            for (const pt of funcPoints[funcName] || []) {
+                api.setVisible(pt, false);
+                api.setLabelVisible(pt, false);
+            }
+        };
+
+        // 显示指定函数的所有交点
+        const showPoints = (funcName: string) => {
+            for (const pt of funcPoints[funcName] || []) {
+                api.setVisible(pt, true);
+                api.setLabelVisible(pt, true);
+            }
+        };
+
+        // 注册点击事件监听
+        api.registerClickListener((clickedName: string) => {
+            const clickedType = api.getObjectType(clickedName);
+
+            if (clickedType === 'function') {
+                if (activeFunc === clickedName) {
+                    // 再次点击同一函数 → 隐藏交点
+                    hidePoints(clickedName);
+                    activeFunc = null;
+                } else {
+                    // 切换到新函数：先隐藏旧的，再显示新的
+                    if (activeFunc) hidePoints(activeFunc);
+                    showPoints(clickedName);
+                    activeFunc = clickedName;
+                }
+            } else if (clickedType !== 'point') {
+                // 点击非函数/非交点区域 → 隐藏所有交点
+                if (activeFunc) {
+                    hidePoints(activeFunc);
+                    activeFunc = null;
+                }
+            }
+        });
+
+        console.log(`[GeoGebra] Registered click-to-show for ${totalPoints} intersection point(s) across ${funcNames.length} functions`);
+    } catch (e) {
+        console.warn('[GeoGebra] Error setting up intersection points:', e);
+    }
 }
