@@ -193,6 +193,69 @@
     }
 }
 
+/* ─── Custom Slider Overlay (3D mode) ─── */
+
+.ggb-slider-overlay {
+    position: absolute;
+    bottom: 8px;
+    left: 12px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    pointer-events: auto;
+}
+
+.ggb-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(6px);
+    padding: 4px 10px;
+    border-radius: 6px;
+}
+
+.ggb-slider-label {
+    color: #fff;
+    font-size: 0.8em;
+    font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
+    min-width: 80px;
+    white-space: nowrap;
+}
+
+.ggb-slider-input {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 140px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+}
+
+.ggb-slider-input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: #fff;
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.ggb-slider-input::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: #fff;
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
 /* ─── Error display ─── */
 
 .geogebra-error {

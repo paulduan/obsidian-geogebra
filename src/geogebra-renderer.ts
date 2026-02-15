@@ -120,8 +120,8 @@ async function cacheSet(key: string, value: string): Promise<void> {
  */
 const APP_NAMES: Record<RenderMode, string> = {
     [RenderMode.Geometry2D]: 'classic',
-    [RenderMode.Geometry3D]: '3d',
-    [RenderMode.Graph]: 'graphing',
+    [RenderMode.Geometry3D]: '3d',      // 使用原生 3d 应用，滑块可直接显示在画布上
+    [RenderMode.Graph]: 'classic',   // 使用 classic 以支持 perspective 隐藏代数面板
 };
 
 /**
@@ -129,9 +129,9 @@ const APP_NAMES: Record<RenderMode, string> = {
  * 字符含义：A=代数面板, G=平面图形, T=3D视图, S=电子表格
  */
 const DEFAULT_PERSPECTIVES: Record<RenderMode, string> = {
-    [RenderMode.Geometry2D]: 'AG',  // 代数面板 + 平面图形
-    [RenderMode.Geometry3D]: 'AT',  // 代数面板 + 3D 视图
-    [RenderMode.Graph]: 'AG',      // 代数面板 + 平面图形
+    [RenderMode.Geometry2D]: 'G',   // 仅平面图形（隐藏代数面板）
+    [RenderMode.Geometry3D]: 'T',   // 仅 3D 视图（隐藏代数面板）
+    [RenderMode.Graph]: 'G',       // 仅平面图形（隐藏代数面板）
 };
 
 /** 各模式的默认画布高度（像素） */
@@ -506,7 +506,18 @@ export async function renderGeoGebra(
                 }
             }, timeoutMs);
 
-            const perspective = userParams.perspective || DEFAULT_PERSPECTIVES[mode];
+            // 确定视图布局：用户指定 > 自动检测 > 默认隐藏面板
+            // 字符含义：A=代数面板, G=2D图形, T=3D视图
+            // 注意：3D 模式使用 '3d' 应用，perspective 构造参数无效，
+            //       面板隐藏在 appletOnLoad 中通过 api.setPerspective('T') 实现。
+            let perspective = userParams.perspective || DEFAULT_PERSPECTIVES[mode];
+            if (!userParams.perspective && mode !== RenderMode.Geometry3D) {
+                if (userParams.keyboard === true) {
+                    // @keyboard true → 显示代数面板
+                    perspective = 'A' + perspective;
+                }
+                // 2D/Graph 模式下 perspective='G' 已包含 Graphics View，滑块自动可见
+            }
             const showToolBar = userParams.toolbar ?? false;
 
             // GGBApplet 构造参数
@@ -518,8 +529,8 @@ export async function renderGeoGebra(
                 height,
                 perspective,                     // 视图布局
                 scaleContainerClass: 'ggb-applet-container',
-                showAlgebraInput: userParams.keyboard ?? true,   // 代数输入框
-                showKeyboardOnFocus: userParams.keyboard ?? true, // 聚焦时弹出虚拟键盘
+                showAlgebraInput: perspective.includes('A'),      // 有代数面板时开启输入框
+                showKeyboardOnFocus: userParams.keyboard ?? false, // 聚焦时弹出虚拟键盘
                 algebraInputPosition: 'algebra',
                 showToolBar,
                 showToolBarHelp: false,
@@ -548,6 +559,13 @@ export async function renderGeoGebra(
                     appletDiv.style.display = '';
                     applyAllSizing();
 
+                    // 3D 模式（'3d' 应用）：初始化后通过 API 隐藏代数面板
+                    // '3d' 应用不支持构造参数 perspective，需要加载后调用 setPerspective
+                    // 这样滑块仍然作为浮动控件保留在 3D 画布上
+                    if (mode === RenderMode.Geometry3D && userParams.keyboard !== true) {
+                        try { api.setPerspective('T'); } catch { /* 忽略 */ }
+                    }
+
                     // 在执行命令之前应用网格/坐标轴设置
                     if (userParams.grid !== undefined) {
                         api.setGridVisible(userParams.grid);
@@ -558,6 +576,14 @@ export async function renderGeoGebra(
 
                     // 执行所有 GeoGebra 命令
                     executeCommands(api, commands);
+
+                    // ── 自定义滑块覆盖层 ──
+                    // 3D 模式隐藏代数面板后，GeoGebra 滑块不可见。
+                    // 检测 Slider() 命令，在画布底部叠加 HTML 滑块控件，
+                    // 通过 api.setValue() 实时同步 GeoGebra 变量。
+                    if (mode === RenderMode.Geometry3D && userParams.keyboard !== true) {
+                        createSliderOverlay(api, commands, container);
+                    }
 
                     // 3D 模式下默认线条较粗，自动调细（除非用户已通过 SetLineThickness 自定义）
                     if (mode === RenderMode.Geometry3D) {
@@ -1103,18 +1129,93 @@ function executeCommands(api: any, commands: string[]): void {
 
         console.log(`[GeoGebra] All ${commands.length} commands executed`);
 
-        // 自动为函数对象显示标签（如 "f(x) = sin(x)"）
+        // 自动为对象显示标签
+        // perspective 为 'G'/'T'（无代数面板）时，GeoGebra 不会自动显示标签，需主动开启
         // 标签样式：0=仅名称, 1=名称+值, 2=仅值, 3=标题
         try {
             const allNames = api.getAllObjectNames() || [];
+            // 不需要显示标签的辅助对象类型
+            const silentTypes = new Set(['numeric', 'boolean', 'slider', 'list', 'image']);
             for (const name of allNames) {
-                if (api.getObjectType(name) === 'function') {
+                const objType = (api.getObjectType(name) || '').toLowerCase();
+                if (silentTypes.has(objType)) continue;
+                // 函数使用 NAME_VALUE 样式（如 "f(x) = x²"）
+                if (objType === 'function') {
                     api.setLabelVisible(name, true);
-                    api.setLabelStyle(name, 1); // NAME_VALUE 样式
+                    api.setLabelStyle(name, 1);
+                } else {
+                    // 点、线、多边形等几何对象显示名称
+                    api.setLabelVisible(name, true);
+                    api.setLabelStyle(name, 0); // 仅名称
                 }
             }
         } catch { /* 忽略 */ }
     } catch (e) {
         console.error('[GeoGebra] Error executing commands:', e);
     }
+}
+
+/**
+ * 在 GeoGebra 画布底部创建自定义 HTML 滑块控件。
+ *
+ * 3D 模式隐藏代数面板后，GeoGebra 内部的 Slider 不可见。
+ * 此函数从命令列表中解析 Slider() 定义，创建对应的 HTML <input type="range">
+ * 元素，叠加在画布底部。用户拖动时通过 api.setValue() 实时更新 GeoGebra 变量。
+ *
+ * 命令格式：varName = Slider(min, max, step)
+ */
+function createSliderOverlay(api: any, commands: string[], container: HTMLElement): void {
+    // 解析 Slider 命令：name = Slider(min, max, step)
+    const sliderRegex = /^(\w+)\s*=\s*Slider\s*\(\s*([\d.eE+-]+)\s*,\s*([\d.eE+-]+)\s*(?:,\s*([\d.eE+-]+))?\s*\)/i;
+    const sliders: { name: string; min: number; max: number; step: number }[] = [];
+
+    for (const cmd of commands) {
+        const m = cmd.match(sliderRegex);
+        if (m) {
+            sliders.push({
+                name: m[1],
+                min: parseFloat(m[2]),
+                max: parseFloat(m[3]),
+                step: m[4] ? parseFloat(m[4]) : 0.1,
+            });
+        }
+    }
+
+    if (sliders.length === 0) return;
+
+    // 创建滑块容器
+    const overlay = document.createElement('div');
+    overlay.className = 'ggb-slider-overlay';
+
+    for (const s of sliders) {
+        const row = document.createElement('div');
+        row.className = 'ggb-slider-row';
+
+        const label = document.createElement('span');
+        label.className = 'ggb-slider-label';
+        const currentVal = api.getValue(s.name) ?? s.min;
+        label.textContent = `${s.name} = ${Number(currentVal.toFixed(4))}`;
+
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.className = 'ggb-slider-input';
+        input.min = String(s.min);
+        input.max = String(s.max);
+        input.step = String(s.step);
+        input.value = String(currentVal);
+
+        // 拖动时实时更新 GeoGebra 变量
+        input.addEventListener('input', () => {
+            const val = parseFloat(input.value);
+            api.setValue(s.name, val);
+            label.textContent = `${s.name} = ${Number(val.toFixed(4))}`;
+        });
+
+        row.appendChild(label);
+        row.appendChild(input);
+        overlay.appendChild(row);
+    }
+
+    container.appendChild(overlay);
+    console.log(`[GeoGebra] Created ${sliders.length} slider overlay(s)`);
 }
