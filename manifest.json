@@ -3,7 +3,8 @@
   "name": "GeoGebra Renderer",
   "version": "1.1.74",
   "minAppVersion": "0.15.0",
-  "description": "Render GeoGebra code blocks (2D geometry, 3D geometry, function graphs) with native GeoGebra API",
+  "description": "Render interactive GeoGebra graphs (2D, 3D, graphing) in Obsidian notes",
   "author": "duan",
-  "isDesktopOnly": false
+  "authorUrl": "https://github.com/paulduan",
+  "isDesktopOnly": true
 }
