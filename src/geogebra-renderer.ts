@@ -561,17 +561,29 @@ export async function renderGeoGebra(
 
                     // 3D 模式（'3d' 应用）：初始化后通过 API 隐藏代数面板
                     // '3d' 应用不支持构造参数 perspective，需要加载后调用 setPerspective
-                    // 这样滑块仍然作为浮动控件保留在 3D 画布上
                     if (mode === RenderMode.Geometry3D && userParams.keyboard !== true) {
                         try { api.setPerspective('T'); } catch { /* 忽略 */ }
                     }
 
-                    // 在执行命令之前应用网格/坐标轴设置
-                    if (userParams.grid !== undefined) {
-                        api.setGridVisible(userParams.grid);
-                    }
+                    // 应用网格/坐标轴设置
+                    // 注意：setPerspective('T') 会重置坐标轴状态，
+                    // 所以坐标轴设置必须在 setPerspective 之后执行。
+                    // 如果用户未显式设置 @axes，3D 模式默认显示坐标轴。
                     if (userParams.axes !== undefined) {
                         api.setAxesVisible(userParams.axes, userParams.axes);
+                        if (mode === RenderMode.Geometry3D) {
+                            try { api.setAxesVisible(userParams.axes, userParams.axes, userParams.axes); } catch { /* 忽略 */ }
+                        }
+                    } else if (mode === RenderMode.Geometry3D) {
+                        // setPerspective('T') 可能隐藏坐标轴，默认恢复显示
+                        try {
+                            api.setAxesVisible(true, true, true);
+                        } catch {
+                            api.setAxesVisible(true, true);
+                        }
+                    }
+                    if (userParams.grid !== undefined) {
+                        api.setGridVisible(userParams.grid);
                     }
 
                     // 执行所有 GeoGebra 命令
@@ -619,13 +631,26 @@ export async function renderGeoGebra(
                      */
                     const apply3DView = (api: any, cx: number, cy: number, cz: number, z: number) => {
                         api.evalCommand('SetActiveView(2)');  // 2 = 3D 视图
-                        const cmd = `SetCoordSystem(${cx - z}, ${cx + z}, ${cy - z}, ${cy + z}, ${cz - z}, ${cz + z})`;
+                        // 坐标系范围：center ± zoom，但始终扩展到包含原点，
+                        // 否则坐标轴（经过原点）会落在可视范围外。
+                        const xMin = Math.min(cx - z, 0);
+                        const xMax = Math.max(cx + z, 0);
+                        const yMin = Math.min(cy - z, 0);
+                        const yMax = Math.max(cy + z, 0);
+                        const zMin = Math.min(cz - z, 0);
+                        const zMax = Math.max(cz + z, 0);
+                        const cmd = `SetCoordSystem(${xMin}, ${xMax}, ${yMin}, ${yMax}, ${zMin}, ${zMax})`;
                         api.evalCommand(cmd);
                         console.log(`[GeoGebra] 3D SetCoordSystem: ${cmd}`);
-                        // JS API 作为回退方案
                         try {
-                            api.setCoordSystem(cx - z, cx + z, cy - z, cy + z, cz - z, cz + z);
+                            api.setCoordSystem(xMin, xMax, yMin, yMax, zMin, zMax);
                         } catch (_) { /* 忽略 */ }
+                        // SetCoordSystem 会重置坐标轴，需重新设置
+                        if (userParams.axes !== false) {
+                            try { api.setAxesVisible(true, true, true); } catch {
+                                try { api.setAxesVisible(true, true); } catch { /* 忽略 */ }
+                            }
+                        }
                     };
 
                     setTimeout(() => {
