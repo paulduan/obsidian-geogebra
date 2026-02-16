@@ -1,7 +1,7 @@
 {
   "id": "obsidian-geogebra",
   "name": "GeoGebra Renderer",
-  "version": "1.1.94",
+  "version": "1.1.99",
   "minAppVersion": "0.15.0",
   "description": "Render interactive GeoGebra graphs (2D, 3D, graphing) in Obsidian notes",
   "author": "duan",

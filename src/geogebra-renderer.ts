@@ -11,6 +11,7 @@
  */
 import { loadGeoGebra, getGeoGebraVersion } from './geogebra-loader';
 import { RenderMode } from './types';
+import { renderMath, finishRenderMath, loadMathJax } from 'obsidian';
 
 /** GGBApplet 由 deployggb.js 动态注入到 window 上，这里声明类型 */
 declare const GGBApplet: any;
@@ -1393,10 +1394,13 @@ function calcVisibleBBox2D(api: any): { mnX: number; mxX: number; mnY: number; m
  * @param api       GeoGebra API 对象
  * @param container 外层 DOM 容器
  */
-function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChange?: () => void): void {
+async function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChange?: () => void): Promise<void> {
     try {
+        // 预先加载 MathJax，确保 renderMath 可用
+        try { await loadMathJax(); } catch { /* 忽略 */ }
+
         const allNames: string[] = api.getAllObjectNames() || [];
-        const funcEntries: { name: string; expr: string; color: string }[] = [];
+        const funcEntries: { name: string; expr: string; latex: string; color: string }[] = [];
 
         for (const name of allNames) {
             const objType = (api.getObjectType(name) || '').toLowerCase();
@@ -1404,9 +1408,13 @@ function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChang
                 && objType !== 'line' && objType !== 'implicit') continue;
 
             let expr = '';
+            let latex = '';
             try {
                 expr = api.getDefinitionString(name) || api.getValueString(name) || name;
             } catch { expr = name; }
+            try {
+                latex = api.getLaTeXString?.(name) || '';
+            } catch { /* 忽略 */ }
 
             let color = '#4285f4';
             try {
@@ -1414,7 +1422,7 @@ function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChang
                 if (r) color = r;
             } catch { /* 忽略 */ }
 
-            funcEntries.push({ name, expr, color });
+            funcEntries.push({ name, expr, latex, color });
         }
 
         if (funcEntries.length === 0) return;
@@ -1469,8 +1477,18 @@ function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChang
 
             const label = document.createElement('span');
             label.className = 'ggb-func-label';
-            label.textContent = entry.expr;
             label.title = entry.expr;
+            if (entry.latex) {
+                try {
+                    const fullLatex = `${entry.name}(x) = ${entry.latex}`;
+                    const mathEl = renderMath(fullLatex, false);
+                    label.appendChild(mathEl);
+                } catch {
+                    label.textContent = entry.expr;
+                }
+            } else {
+                label.textContent = entry.expr;
+            }
 
             const eye = document.createElement('span');
             eye.className = 'ggb-func-eye';
@@ -1546,6 +1564,10 @@ function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChang
         });
 
         container.appendChild(wrapper);
+
+        // 面板插入 DOM 后，触发 MathJax/KaTeX 排版
+        try { finishRenderMath(); } catch { /* 忽略 */ }
+
         console.log(`[GeoGebra] Created function panel with ${funcEntries.length} entries`);
     } catch (e) {
         console.warn('[GeoGebra] Error creating function panel:', e);

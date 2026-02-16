@@ -395,6 +395,20 @@
     min-width: 0;
 }
 
+/* MathJax / KaTeX rendered math inside the function label */
+.ggb-func-label .math,
+.ggb-func-label mjx-container,
+.ggb-func-label .MathJax,
+.ggb-func-label .katex {
+    font-size: 1em !important;
+    color: #fff !important;
+    display: inline !important;
+    vertical-align: baseline;
+}
+.ggb-func-label .katex .katex-html {
+    white-space: nowrap;
+}
+
 .ggb-func-eye {
     font-size: 0.7em;
     flex-shrink: 0;
