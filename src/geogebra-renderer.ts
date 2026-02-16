@@ -720,6 +720,8 @@ export async function renderGeoGebra(
                                                 try {
                                                     const objType = api.getObjectType(nm);
                                                     if (skipTypes.has(objType)) continue;
+                                                    // 跳过不可见对象
+                                                    try { if (!api.getVisible(nm)) continue; } catch { /* 默认包含 */ }
 
                                                     // 方法1：对点对象直接获取坐标
                                                     if (objType === 'point' || objType === 'point3d') {
@@ -754,10 +756,10 @@ export async function renderGeoGebra(
                                                 // z 轴如果没有 3D 坐标数据，默认 ±5
                                                 if (mnZ === Infinity) { mnZ = -5; mxZ = 5; }
 
-                                                // 每个轴独立计算范围和 padding
+                                                // 每个轴独立计算范围和 padding（25%，最小 1 单位）
                                                 const axisPad = (min: number, max: number) => {
-                                                    const range = max - min || 10;
-                                                    const p = range * 0.25 + 2; // 25% padding + 2 单位缓冲
+                                                    const range = max - min || 5;
+                                                    const p = Math.max(range * 0.25, 1);
                                                     return [min - p, max + p] as [number, number];
                                                 };
                                                 const [x0, x1] = axisPad(mnX, mxX);
@@ -790,102 +792,104 @@ export async function renderGeoGebra(
                                 const [xMin, xMax, yMin, yMax] = userParams.range;
                                 api.setCoordSystem(xMin, xMax, yMin, yMax);
                                 console.log(`[GeoGebra] 2D range: [${xMin}, ${xMax}, ${yMin}, ${yMax}]`);
-                            } else if (userParams.center) {
-                                // ── 2D 中心点 + 缩放 ──
-                                const [cx, cy] = userParams.center;
+                            } else if (userParams.center || userParams.zoom) {
+                                // ── 2D 中心点 + 缩放（等比 1:1） ──
+                                // @center 和 @zoom 可以单独使用或组合使用：
+                                //   @center x,y @zoom r → 以 (x,y) 为中心，y 半径 r
+                                //   @center x,y         → 以 (x,y) 为中心，自动计算半径
+                                //   @zoom r             → 自动计算中心，使用半径 r
+                                // x 范围根据容器宽高比自动扩展，保证坐标比例 1:1。
+                                let cx = 0, cy = 0;
+                                if (userParams.center) {
+                                    [cx, cy] = userParams.center;
+                                }
                                 let z = userParams.zoom || 0;
 
-                                // zoom 必须为正数（半径）。如果 ≤ 0 或未设置，
-                                // 从包围盒自动计算：取中心到最远点的距离 + padding。
+                                // 如果没有指定 @center，从包围盒中心自动计算
+                                if (!userParams.center) {
+                                    try {
+                                        const bbox = calcVisibleBBox2D(api);
+                                        if (bbox) {
+                                            cx = (bbox.mnX + bbox.mxX) / 2;
+                                            cy = (bbox.mnY + bbox.mxY) / 2;
+                                        }
+                                    } catch { /* 使用默认 (0,0) */ }
+                                }
+
+                                // zoom 必须为正数（y 轴半径）。如果 ≤ 0 或未设置，
+                                // 从包围盒自动计算：取中心到最远角的距离 + 20% padding。
                                 if (z <= 0) {
                                     try {
-                                        const names2 = api.getAllObjectNames() || [];
-                                        const skip2 = new Set(['numeric','angle','boolean','function','text','list','image']);
-                                        let maxDist = 0;
-                                        for (const nm of names2) {
-                                            try {
-                                                const ot = api.getObjectType(nm);
-                                                if (skip2.has(ot)) continue;
-                                                if (ot === 'point') {
-                                                    const px = api.getXcoord(nm);
-                                                    const py = api.getYcoord(nm);
-                                                    if (typeof px === 'number' && !isNaN(px) &&
-                                                        typeof py === 'number' && !isNaN(py)) {
-                                                        maxDist = Math.max(maxDist,
-                                                            Math.abs(px - cx), Math.abs(py - cy));
-                                                    }
-                                                }
-                                            } catch { /* 忽略 */ }
+                                        const bbox = calcVisibleBBox2D(api);
+                                        if (bbox) {
+                                            const hx = Math.max(Math.abs(bbox.mxX - cx), Math.abs(bbox.mnX - cx));
+                                            const hy = Math.max(Math.abs(bbox.mxY - cy), Math.abs(bbox.mnY - cy));
+                                            z = Math.max(hx, hy) * 1.25 + 0.3;
+                                        } else {
+                                            z = 5;
                                         }
-                                        z = maxDist > 0 ? maxDist * 1.3 + 2 : 10;
-                                    } catch { z = 10; }
+                                    } catch { z = 5; }
                                     console.log(`[GeoGebra] 2D auto-zoom from bbox: z=${z.toFixed(1)}`);
                                 }
 
-                                api.setCoordSystem(cx - z, cx + z, cy - z, cy + z);
-                                console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z.toFixed(1)}`);
+                                // 根据容器宽高比扩展 x 范围，保证像素级 1:1 坐标比例
+                                const ar = width / height;
+                                const xr = z * ar;
+                                api.setCoordSystem(cx - xr, cx + xr, cy - z, cy + z);
+                                console.log(`[GeoGebra] 2D center=(${cx},${cy}) zoom=${z.toFixed(1)} ar=${ar.toFixed(2)} xRange=${(2*xr).toFixed(1)} yRange=${(2*z).toFixed(1)}`);
                             } else {
-                                // ── 2D 自动适配：计算包围盒 + padding ──
-                                // ZoomToFit() 不留足够 padding，标签/对象在画布边缘被截断。
-                                // 改为手动计算所有点的包围盒，设置带 padding 的坐标系。
+                                // ── 2D 自动适配（等比 1:1）──
+                                // 混合策略：
+                                //   1. 先让 GeoGebra ZoomToFit 计算所有对象（含 Locus/Curve）的边界
+                                //   2. 读取 ZoomToFit 后的坐标系范围
+                                //   3. 与我们自己扫描的 Text/Point 包围盒取并集
+                                //   4. 加 padding + 宽高比修正，保证 1:1 且圆不变形
                                 try {
-                                    const names = api.getAllObjectNames() || [];
-                                    const skip = new Set([
-                                        'numeric', 'angle', 'boolean', 'function',
-                                        'text', 'list', 'image',
-                                    ]);
-                                    let mnX = Infinity, mxX = -Infinity;
-                                    let mnY = Infinity, mxY = -Infinity;
-                                    let found2d = false;
-
-                                    for (const nm of names) {
-                                        try {
-                                            const ot = api.getObjectType(nm);
-                                            if (skip.has(ot)) continue;
-
-                                            if (ot === 'point') {
-                                                const px = api.getXcoord(nm);
-                                                const py = api.getYcoord(nm);
-                                                if (typeof px === 'number' && !isNaN(px) &&
-                                                    typeof py === 'number' && !isNaN(py)) {
-                                                    mnX = Math.min(mnX, px); mxX = Math.max(mxX, px);
-                                                    mnY = Math.min(mnY, py); mxY = Math.max(mxY, py);
-                                                    found2d = true;
-                                                }
-                                            }
-
-                                            // 也从值字符串解析 "(x, y)" 坐标
-                                            const vs = api.getValueString(nm) || '';
-                                            const coordRe = /\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/g;
-                                            let mc;
-                                            while ((mc = coordRe.exec(vs)) !== null) {
-                                                const xv = parseFloat(mc[1]);
-                                                const yv = parseFloat(mc[2]);
-                                                if (!isNaN(xv) && !isNaN(yv)) {
-                                                    mnX = Math.min(mnX, xv); mxX = Math.max(mxX, xv);
-                                                    mnY = Math.min(mnY, yv); mxY = Math.max(mxY, yv);
-                                                    found2d = true;
-                                                }
-                                            }
-                                        } catch { /* 忽略 */ }
-                                    }
-
-                                    if (found2d) {
-                                        const axisPad2d = (min: number, max: number) => {
-                                            const range = max - min || 10;
-                                            const p = range * 0.25 + 2;
-                                            return [min - p, max + p] as [number, number];
-                                        };
-                                        const [x0, x1] = axisPad2d(mnX, mxX);
-                                        const [y0, y1] = axisPad2d(mnY, mxY);
-                                        api.setCoordSystem(x0, x1, y0, y1);
-                                        console.log(`[GeoGebra] 2D auto-fit: x=[${x0.toFixed(1)},${x1.toFixed(1)}] y=[${y0.toFixed(1)},${y1.toFixed(1)}]`);
-                                    } else {
-                                        // 无点坐标，回退到 ZoomToFit
+                                    // 步骤 1：让 GeoGebra 计算全部对象的边界
+                                    try {
                                         api.evalCommand('SelectAll()');
                                         api.evalCommand('ZoomToFit()');
                                         api.evalCommand('SelectAll()');
+                                    } catch { /* 忽略 */ }
+
+                                    // 步骤 2：读取 ZoomToFit 后的坐标系
+                                    let mnX = -5, mxX = 5, mnY = -5, mxY = 5;
+                                    try {
+                                        const gxMin = api.getXmin();
+                                        const gxMax = api.getXmax();
+                                        const gyMin = api.getYmin();
+                                        const gyMax = api.getYmax();
+                                        if (typeof gxMin === 'number' && !isNaN(gxMin)) mnX = gxMin;
+                                        if (typeof gxMax === 'number' && !isNaN(gxMax)) mxX = gxMax;
+                                        if (typeof gyMin === 'number' && !isNaN(gyMin)) mnY = gyMin;
+                                        if (typeof gyMax === 'number' && !isNaN(gyMax)) mxY = gyMax;
+                                    } catch { /* 使用默认值 */ }
+                                    console.log(`[GeoGebra] ZoomToFit bounds: x=[${mnX.toFixed(2)},${mxX.toFixed(2)}] y=[${mnY.toFixed(2)},${mxY.toFixed(2)}]`);
+
+                                    // 步骤 3：与 Text/Point 扫描结果取并集
+                                    const bbox = calcVisibleBBox2D(api);
+                                    if (bbox) {
+                                        mnX = Math.min(mnX, bbox.mnX);
+                                        mxX = Math.max(mxX, bbox.mxX);
+                                        mnY = Math.min(mnY, bbox.mnY);
+                                        mxY = Math.max(mxY, bbox.mxY);
                                     }
+
+                                    // 步骤 4：从合并后的包围盒计算等比坐标系
+                                    const cx = (mnX + mxX) / 2;
+                                    const cy = (mnY + mxY) / 2;
+                                    const hx = (mxX - mnX) / 2;
+                                    const hy = (mxY - mnY) / 2;
+                                    const ar = width / height;
+
+                                    // 加 10% padding（ZoomToFit 已经有些余量）
+                                    const ryFromContent = hy * 1.1 + 0.2;
+                                    const rxFromContent = hx * 1.1 + 0.2;
+                                    const ry = Math.max(ryFromContent, rxFromContent / ar);
+                                    const rx = ry * ar;
+
+                                    api.setCoordSystem(cx - rx, cx + rx, cy - ry, cy + ry);
+                                    console.log(`[GeoGebra] 2D auto-fit: center=(${cx.toFixed(2)},${cy.toFixed(2)}) rx=${rx.toFixed(2)} ry=${ry.toFixed(2)} ar=${ar.toFixed(2)} merged=[${mnX.toFixed(2)},${mxX.toFixed(2)},${mnY.toFixed(2)},${mxY.toFixed(2)}]`);
                                 } catch {
                                     try {
                                         api.evalCommand('SelectAll()');
@@ -1313,10 +1317,75 @@ function executeCommands(api: any, commands: string[]): void {
  *
  * 命令格式：varName = Slider(min, max, step)
  */
+
+/**
+ * 计算 2D 模式下所有可见对象（含 Text 位置）的包围盒。
+ *
+ * 跳过不可见对象，将 Text 对象的位置坐标也纳入计算。
+ * 返回 null 表示未找到任何有效坐标。
+ */
+function calcVisibleBBox2D(api: any): { mnX: number; mxX: number; mnY: number; mxY: number } | null {
+    const names = api.getAllObjectNames() || [];
+    const skipTypes = new Set(['numeric', 'angle', 'boolean', 'function', 'list', 'image']);
+    let mnX = Infinity, mxX = -Infinity;
+    let mnY = Infinity, mxY = -Infinity;
+    let found = false;
+
+    for (const nm of names) {
+        try {
+            const ot = (api.getObjectType(nm) || '').toLowerCase();
+            try { if (!api.getVisible(nm)) continue; } catch { /* 默认包含 */ }
+
+            if (ot === 'text') {
+                const vs = api.getValueString(nm) || '';
+                const coordRe = /\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/g;
+                let mc;
+                while ((mc = coordRe.exec(vs)) !== null) {
+                    const xv = parseFloat(mc[1]);
+                    const yv = parseFloat(mc[2]);
+                    if (!isNaN(xv) && !isNaN(yv)) {
+                        mnX = Math.min(mnX, xv); mxX = Math.max(mxX, xv);
+                        mnY = Math.min(mnY, yv); mxY = Math.max(mxY, yv);
+                        found = true;
+                    }
+                }
+                continue;
+            }
+
+            if (skipTypes.has(ot)) continue;
+
+            if (ot === 'point') {
+                const px = api.getXcoord(nm);
+                const py = api.getYcoord(nm);
+                if (typeof px === 'number' && !isNaN(px) &&
+                    typeof py === 'number' && !isNaN(py)) {
+                    mnX = Math.min(mnX, px); mxX = Math.max(mxX, px);
+                    mnY = Math.min(mnY, py); mxY = Math.max(mxY, py);
+                    found = true;
+                }
+            }
+
+            const vs = api.getValueString(nm) || '';
+            const coordRe = /\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/g;
+            let mc;
+            while ((mc = coordRe.exec(vs)) !== null) {
+                const xv = parseFloat(mc[1]);
+                const yv = parseFloat(mc[2]);
+                if (!isNaN(xv) && !isNaN(yv)) {
+                    mnX = Math.min(mnX, xv); mxX = Math.max(mxX, xv);
+                    mnY = Math.min(mnY, yv); mxY = Math.max(mxY, yv);
+                    found = true;
+                }
+            }
+        } catch { /* 忽略 */ }
+    }
+
+    return found ? { mnX, mxX, mnY, mxY } : null;
+}
 /**
  * 创建函数图像控制面板。
  *
- * 在 GeoGebra 图形右上角放置一个图标按钮，默认收起。
+ * 在 GeoGebra 图形左上角放置一个图标按钮，默认收起。
  * 点击图标展开面板，列出所有函数/曲线对象，每个可点击切换显示/隐藏。
  * 面板内提供"全部显示"和"全部隐藏"快捷按钮。
  * 再次点击图标或点击面板外区域收起面板。
@@ -1566,29 +1635,83 @@ function addIntersectionPoints(api: any): void {
         const funcPoints: Record<string, string[]> = {};
         for (const f of funcNames) funcPoints[f] = [];
 
-        // 逐对计算交点，跟踪新增的点对象
+        // 已找到的交点坐标列表（用于去重）
+        const foundCoords: { x: number; y: number }[] = [];
+        const DEDUP_THRESHOLD = 0.05; // 距离小于此阈值视为重复
+
+        /** 检查新点是否与已有交点重复 */
+        const isDuplicate = (px: number, py: number): boolean => {
+            for (const c of foundCoords) {
+                const dist = Math.sqrt((px - c.x) ** 2 + (py - c.y) ** 2);
+                if (dist < DEDUP_THRESHOLD) return true;
+            }
+            return false;
+        };
+
+        /** 处理新增的交点：设置样式、记录关联、去重 */
+        const processNewPoints = (beforeNames: Set<string>, fi: string, fj: string) => {
+            const afterNames = api.getAllObjectNames() || [];
+            for (const name of afterNames) {
+                if (beforeNames.has(name)) continue;
+                if (api.getObjectType(name) !== 'point') continue;
+
+                // 获取坐标并去重
+                const px = api.getXcoord(name);
+                const py = api.getYcoord(name);
+                if (typeof px === 'number' && !isNaN(px) &&
+                    typeof py === 'number' && !isNaN(py)) {
+                    if (isDuplicate(px, py)) {
+                        // 重复交点，删除
+                        try { api.deleteObject(name); } catch { /* 忽略 */ }
+                        continue;
+                    }
+                    foundCoords.push({ x: px, y: py });
+                }
+
+                // 此交点属于两个函数
+                funcPoints[fi].push(name);
+                funcPoints[fj].push(name);
+
+                // 样式：红色大点 + 坐标标签，初始隐藏
+                api.setPointSize(name, 5);
+                api.setColor(name, 220, 50, 50);
+                api.setLabelStyle(name, 2);       // VALUE 样式 (x, y)
+                api.setLabelVisible(name, false);
+                api.setVisible(name, false);
+            }
+        };
+
+        // 获取当前可见 x 范围，用于分段搜索
+        let xMin = -10, xMax = 10;
+        try {
+            const gxMin = api.getXmin();
+            const gxMax = api.getXmax();
+            if (typeof gxMin === 'number' && !isNaN(gxMin)) xMin = gxMin;
+            if (typeof gxMax === 'number' && !isNaN(gxMax)) xMax = gxMax;
+        } catch { /* 使用默认值 */ }
+
+        // 逐对计算交点
         for (let i = 0; i < funcNames.length; i++) {
             for (let j = i + 1; j < funcNames.length; j++) {
-                const beforeNames = new Set(api.getAllObjectNames() || []);
+                // 阶段 1：标准 Intersect（对多项式函数能一次性找到所有代数交点）
+                const before1 = new Set(api.getAllObjectNames() || []);
                 try {
                     api.evalCommand(`Intersect(${funcNames[i]}, ${funcNames[j]})`);
-                } catch { continue; }
+                } catch { /* 忽略 */ }
+                processNewPoints(before1, funcNames[i], funcNames[j]);
 
-                const afterNames = api.getAllObjectNames() || [];
-                for (const name of afterNames) {
-                    if (beforeNames.has(name)) continue;
-                    if (api.getObjectType(name) !== 'point') continue;
-
-                    // 此交点属于两个函数
-                    funcPoints[funcNames[i]].push(name);
-                    funcPoints[funcNames[j]].push(name);
-
-                    // 样式：红色大点 + 坐标标签，初始隐藏
-                    api.setPointSize(name, 5);
-                    api.setColor(name, 220, 50, 50);
-                    api.setLabelStyle(name, 2);       // VALUE 样式 (x, y)
-                    api.setLabelVisible(name, false);
-                    api.setVisible(name, false);
+                // 阶段 2：分段数值搜索（对 sqrt、sin 等超越函数，标准 Intersect 可能漏点）
+                // 将可见 x 范围分成若干小区间，逐段调用 Intersect(f, g, xStart, xEnd)
+                const segCount = 20;
+                const segWidth = (xMax - xMin) / segCount;
+                for (let s = 0; s < segCount; s++) {
+                    const sx = xMin + s * segWidth;
+                    const ex = sx + segWidth;
+                    const before2 = new Set(api.getAllObjectNames() || []);
+                    try {
+                        api.evalCommand(`Intersect(${funcNames[i]}, ${funcNames[j]}, ${sx}, ${ex})`);
+                    } catch { continue; }
+                    processNewPoints(before2, funcNames[i], funcNames[j]);
                 }
             }
         }
