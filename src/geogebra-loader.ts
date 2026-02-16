@@ -70,15 +70,17 @@ const GWT_DEFERRED_RE = /deferredjs\//;
 
 /** 判断 URL 是否是 GeoGebra CDN 地址 */
 function isGeoGebraUrl(url: string): boolean {
-    if (!url || url.startsWith('blob:') || url.startsWith('data:')) return false;
+    if (!url || url.startsWith('data:')) return false;
+    // blob: URL 不算 GeoGebra URL（它们是我们创建的代理 URL）
+    if (url.startsWith('blob:')) return false;
     return GGB_HOSTS.some(host => url.includes(host));
 }
 
 /**
- * 修正被错误路由到 app://obsidian.md/ 的 GeoGebra 资源 URL。
+ * 修正被错误路由到 app://obsidian.md/ 或 blob: URL 的 GeoGebra 资源 URL。
  *
- * 背景：GeoGebra 的 GWT 代码使用相对路径加载资源，但通过 eval() 执行后，
- * 这些相对路径会解析到 app://obsidian.md/ 而非 GeoGebra CDN。
+ * 背景：GeoGebra 的 GWT 代码使用相对路径加载资源，但通过 blob URL 或 eval()
+ * 执行后，这些相对路径会解析到 app://obsidian.md/ 或 blob:... 而非 GeoGebra CDN。
  *
  * 需要修正的资源类型：
  * - GWT 排列文件：9CB48E...cache.js → CDN/web3d/xxx.cache.js
@@ -100,8 +102,15 @@ function resolveMisroutedUrl(url: string): string | null {
     // 已经是 GeoGebra URL，无需修正
     if (isGeoGebraUrl(url)) return null;
 
-    // 去掉 app:// 前缀，得到相对路径
-    const relativePath = url.replace(/^app:\/\/[^/]+\//, '');
+    // 去掉各种非标准前缀，得到相对路径
+    // - app://obsidian.md/xxx → xxx
+    // - blob:app://obsidian.md/uuid → uuid (filename 提取仍有效)
+    // - blob:null/uuid → uuid
+    let relativePath = url;
+    relativePath = relativePath.replace(/^blob:/, '');          // 去掉 blob: 前缀
+    relativePath = relativePath.replace(/^app:\/\/[^/]+\//, ''); // 去掉 app://host/
+    relativePath = relativePath.replace(/^null\//, '');          // 去掉 null/ (某些 blob URL)
+    relativePath = relativePath.replace(/^https?:\/\/[^/]+\//, ''); // 去掉 http(s)://host/
 
     // GWT 缓存文件（32 位哈希 + .cache.js）
     const filename = relativePath.split('/').pop() || '';
@@ -161,7 +170,14 @@ function fixGeoGebraPath(url: string): string {
  * @returns 需要拦截时返回修正后的 CDN URL；不需要拦截返回 null
  */
 function getInterceptUrl(url: string): string | null {
+    if (!url) return null;
     if (isGeoGebraUrl(url)) return fixGeoGebraPath(url);
+    // 跳过我们自己创建的 blob URL（避免无限递归拦截）
+    // blob URL 格式为 blob:app://obsidian.md/uuid-only（没有路径后缀如 .cache.js）
+    // GWT 生成的 misrouted URL 则有具体的文件后缀
+    if (url.startsWith('blob:') && !url.includes('.cache.js') && !url.includes('deferredjs')) {
+        return null;
+    }
     return resolveMisroutedUrl(url);
 }
 
@@ -229,19 +245,27 @@ function fetchBinary(url: string): Promise<ArrayBuffer> {
  * iframe 的作用域。Blob URL 方式可以保持正确的执行上下文。
  * 如果 Blob URL 被 CSP 阻止，则回退到 eval()。
  *
- * @param parent     script 元素的父节点
- * @param child      被拦截的 <script> 元素
- * @param fetchUrl   修正后的 CDN URL
- * @param evalContext eval 的执行上下文（主窗口或 iframe）
- * @param refNode    insertBefore 的参考节点
+ * @param parent       script 元素的父节点
+ * @param child        被拦截的 <script> 元素
+ * @param fetchUrl     修正后的 CDN URL
+ * @param evalContext   eval 的执行上下文（主窗口或 iframe）
+ * @param refNode      insertBefore 的参考节点
+ * @param nativeAppend 正确 realm 的原始 appendChild（用于跨 iframe 场景）
+ * @param nativeInsert 正确 realm 的原始 insertBefore（用于跨 iframe 场景）
  */
 async function handleScriptInterception(
     parent: Node,
     child: HTMLScriptElement,
     fetchUrl: string,
     evalContext?: Window,
-    refNode?: Node | null
+    refNode?: Node | null,
+    nativeAppend?: typeof Node.prototype.appendChild,
+    nativeInsert?: typeof Node.prototype.insertBefore
 ): Promise<void> {
+    // 使用传入的 realm 原始方法，回退到主窗口的（兜底）
+    const appendFn = nativeAppend || origAppendChild;
+    const insertFn = nativeInsert || origInsertBefore;
+
     try {
         const code = await fetchText(fetchUrl);
 
@@ -249,6 +273,9 @@ async function handleScriptInterception(
         const blob = new Blob([code], { type: 'application/javascript' });
         const blobUrl = URL.createObjectURL(blob);
         const filename = fetchUrl.split('/').pop()?.substring(0, 60) || 'unknown';
+
+        // 保存原始 URL 到 data 属性（用于诊断和 GWT 脚本搜索回退）
+        child.setAttribute('data-ggb-original-src', fetchUrl);
 
         // 替换 src 为 Blob URL
         child.removeAttribute('src');
@@ -287,11 +314,11 @@ async function handleScriptInterception(
             }
         };
 
-        // 使用原始方法将 script 插入 DOM（触发浏览器加载 Blob URL）
+        // 使用正确 realm 的原始方法将 script 插入 DOM（触发浏览器加载 Blob URL）
         if (refNode !== undefined && refNode !== null) {
-            origInsertBefore.call(parent, child, refNode);
+            insertFn.call(parent, child, refNode);
         } else {
-            origAppendChild.call(parent, child);
+            appendFn.call(parent, child);
         }
         console.log(`[GeoGebra] Appended script with blob URL: ${filename}`);
     } catch (e) {
@@ -372,7 +399,8 @@ function patchNodePrototype(win: Window, label: string): void {
                 const interceptUrl = getInterceptUrl(src);
                 if (interceptUrl) {
                     console.log(`[GeoGebra][${label}] Intercepting script: ${src.substring(0, 80)} → CDN`);
-                    handleScriptInterception(this, child, interceptUrl, win);
+                    // 传入本 realm 的原始 append/insert，确保跨 iframe 正常工作
+                    handleScriptInterception(this, child, interceptUrl, win, null, _origAppend, _origInsert);
                     return child;
                 }
             }
@@ -404,7 +432,7 @@ function patchNodePrototype(win: Window, label: string): void {
                 const interceptUrl = getInterceptUrl(src);
                 if (interceptUrl) {
                     console.log(`[GeoGebra][${label}] Intercepting script: ${src.substring(0, 80)} → CDN`);
-                    handleScriptInterception(this, child, interceptUrl, win, ref);
+                    handleScriptInterception(this, child, interceptUrl, win, ref, _origAppend, _origInsert);
                     return child;
                 }
             }
@@ -432,10 +460,14 @@ function patchNodePrototype(win: Window, label: string): void {
 const patchedIframes = new WeakSet<HTMLIFrameElement>();
 
 /**
- * Patch iframe 的 Node.prototype。
+ * Patch iframe 的 Node.prototype、XMLHttpRequest 和 fetch。
  *
  * GeoGebra 使用 GWT 框架，GWT 会创建 iframe 来执行编译后的 Java 代码。
- * 这些 iframe 内部也会动态创建 <script> 加载资源，需要同样的拦截。
+ * 这些 iframe 内部也会动态创建 <script> 加载资源，以及通过 XHR/fetch
+ * 加载 deferred JS 片段（代码分割），全部需要拦截。
+ *
+ * 每个 iframe 有独立的 JavaScript realm（独立的 Node.prototype、
+ * XMLHttpRequest.prototype、window.fetch），必须分别 patch。
  *
  * 分两次 patch：
  * 1. 立即 patch（空白 iframe 创建时 contentWindow 已可用）
@@ -445,15 +477,120 @@ function patchIframe(iframe: HTMLIFrameElement): void {
     if (patchedIframes.has(iframe)) return;
     patchedIframes.add(iframe);
 
+    /** 已 patch 的 iframe window 集合，避免重复 patch 同一个 window */
+    const patchedWins = new WeakSet<Window>();
+
     function doPatch() {
         try {
             const iframeWin = iframe.contentWindow;
-            if (iframeWin && iframeWin.Node) {
+            if (!iframeWin || patchedWins.has(iframeWin)) return;
+            patchedWins.add(iframeWin);
+
+            // 1. Patch Node.prototype（拦截 <script> / <link> 的 DOM 注入）
+            if (iframeWin.Node) {
                 patchNodePrototype(iframeWin, 'iframe');
                 console.log('[GeoGebra] Patched iframe Node.prototype');
             }
+
+            // 2. Patch XMLHttpRequest（拦截 GWT deferred JS 片段的 XHR 请求）
+            try {
+                const iframeXHRProto = iframeWin.XMLHttpRequest?.prototype;
+                if (iframeXHRProto && iframeXHRProto.open !== XMLHttpRequest.prototype.open) {
+                    const _iframeOrigOpen = iframeXHRProto.open;
+                    const _iframeOrigSend = iframeXHRProto.send;
+
+                    iframeXHRProto.open = function (
+                        method: string, url: string | URL, async?: boolean,
+                        username?: string | null, password?: string | null
+                    ): void {
+                        const urlStr = url.toString();
+                        const interceptUrl = getInterceptUrl(urlStr);
+                        if (interceptUrl) {
+                            xhrInterceptMap.set(this, { url: interceptUrl, method });
+                            console.log(`[GeoGebra][iframe] XHR intercepted: ${method} ${urlStr.substring(0, 100)}`);
+                        }
+                        return _iframeOrigOpen.call(this, method, url, async ?? true, username, password);
+                    };
+
+                    iframeXHRProto.send = function (body?: Document | XMLHttpRequestBodyInit | null): void {
+                        const interceptInfo = xhrInterceptMap.get(this);
+                        if (interceptInfo) {
+                            const { url } = interceptInfo;
+                            requestUrl({ url, headers: BROWSER_HEADERS }).then(response => {
+                                Object.defineProperty(this, 'readyState', { value: 4, writable: true, configurable: true });
+                                Object.defineProperty(this, 'status', { value: 200, writable: true, configurable: true });
+                                Object.defineProperty(this, 'statusText', { value: 'OK', writable: true, configurable: true });
+                                Object.defineProperty(this, 'responseText', { value: response.text, writable: true, configurable: true });
+                                Object.defineProperty(this, 'response', { value: response.text, writable: true, configurable: true });
+                                Object.defineProperty(this, 'responseURL', { value: url, writable: true, configurable: true });
+                                console.log(`[GeoGebra][iframe] XHR proxied OK: ${url.split('/').pop()?.substring(0, 50)}`);
+                                this.dispatchEvent(new Event('readystatechange'));
+                                this.dispatchEvent(new ProgressEvent('progress'));
+                                this.dispatchEvent(new Event('load'));
+                                this.dispatchEvent(new ProgressEvent('loadend'));
+                                if (this.onreadystatechange) {
+                                    try { this.onreadystatechange(new Event('readystatechange') as any); } catch {}
+                                }
+                                if (this.onload) {
+                                    try { this.onload(new ProgressEvent('load') as any); } catch {}
+                                }
+                            }).catch(e => {
+                                console.error(`[GeoGebra][iframe] XHR proxy failed: ${url}`, e);
+                                Object.defineProperty(this, 'readyState', { value: 4, writable: true, configurable: true });
+                                Object.defineProperty(this, 'status', { value: 0, writable: true, configurable: true });
+                                this.dispatchEvent(new ProgressEvent('error'));
+                                this.dispatchEvent(new ProgressEvent('loadend'));
+                                if (this.onerror) {
+                                    try { this.onerror(new ProgressEvent('error') as any); } catch {}
+                                }
+                            });
+                            return;
+                        }
+                        return _iframeOrigSend.call(this, body);
+                    };
+                    console.log('[GeoGebra] Patched iframe XMLHttpRequest');
+                }
+            } catch (e) {
+                console.warn('[GeoGebra] Failed to patch iframe XHR:', e);
+            }
+
+            // 3. Patch fetch（拦截 GWT 可能通过 fetch 加载的资源）
+            try {
+                if (iframeWin.fetch && iframeWin.fetch !== window.fetch) {
+                    const _iframeOrigFetch = iframeWin.fetch.bind(iframeWin);
+                    (iframeWin as any).fetch = async function (
+                        input: RequestInfo | URL, init?: RequestInit
+                    ): Promise<Response> {
+                        const url = input instanceof Request ? input.url : input.toString();
+                        const interceptUrl = getInterceptUrl(url);
+                        if (interceptUrl) {
+                            console.log(`[GeoGebra][iframe] Fetch intercepted: ${url.substring(0, 100)}`);
+                            try {
+                                const response = await requestUrl({ url: interceptUrl, headers: BROWSER_HEADERS });
+                                const contentType = url.endsWith('.css') ? 'text/css'
+                                    : url.endsWith('.js') ? 'application/javascript'
+                                    : url.endsWith('.json') ? 'application/json'
+                                    : 'application/octet-stream';
+                                console.log(`[GeoGebra][iframe] Fetch proxied OK: ${url.split('/').pop()?.substring(0, 50)}`);
+                                return new Response(response.text, {
+                                    status: 200, statusText: 'OK',
+                                    headers: new Headers({ 'Content-Type': contentType }),
+                                });
+                            } catch (e) {
+                                console.error(`[GeoGebra][iframe] Fetch proxy failed: ${url}`, e);
+                                throw e;
+                            }
+                        }
+                        return _iframeOrigFetch(input, init);
+                    };
+                    console.log('[GeoGebra] Patched iframe fetch');
+                }
+            } catch (e) {
+                console.warn('[GeoGebra] Failed to patch iframe fetch:', e);
+            }
         } catch (e) {
             // 跨域 iframe 无法 patch（GWT iframe 不应是跨域的）
+            console.warn('[GeoGebra] Failed to patch iframe:', e);
         }
     }
 

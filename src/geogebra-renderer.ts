@@ -11,29 +11,23 @@
  */
 import { loadGeoGebra, getGeoGebraVersion } from './geogebra-loader';
 import { RenderMode } from './types';
-import type { Vault } from 'obsidian';
 
 /** GGBApplet 由 deployggb.js 动态注入到 window 上，这里声明类型 */
 declare const GGBApplet: any;
 
-// ─── 文件缓存系统（用于 PDF 导出） ───────────────────────────
-// PDF 导出时 Obsidian 会重新渲染 markdown，但不会等待 GeoGebra 从 CDN 加载。
-// 缓存机制在首次渲染后保存 PNG 快照，PDF 导出时直接使用缓存。
-// 采用双层缓存：文件缓存（持久化）+ localStorage（快速回退）。
+// ─── 内存缓存（用于 PDF 导出） ────────────────────────────────
+// PDF 导出时 Obsidian 在分离的 DOM 中重新渲染 markdown，不等待 GeoGebra 加载。
+// 内存缓存在首次渲染后保存 PNG 快照，PDF 导出时直接使用。
+// 同步 Map，零延迟，不可能失败。重启 Obsidian 后需重新打开笔记生成缓存。
 
-/** Obsidian vault 引用，用于读写缓存文件 */
-let cacheVault: Vault | null = null;
-/** 缓存目录路径（相对于 vault 根目录） */
-let cacheDirPath = '.obsidian/plugins/obsidian-geogebra/cache';
+/** PNG 快照缓存：key → HTML img 标签（含 base64 数据） */
+const memoryCache = new Map<string, string>();
 
 /**
- * 设置缓存目录。由 main.ts 在插件加载时调用。
- * @param vault Obsidian vault 实例
- * @param dir 缓存目录的相对路径
+ * 设置缓存目录。保留接口兼容性（main.ts 调用），但不再使用文件缓存。
  */
-export function setCacheDir(vault: Vault, dir: string): void {
-    cacheVault = vault;
-    cacheDirPath = dir;
+export function setCacheDir(_vault: any, _dir: string): void {
+    // no-op: 仅使用内存缓存
 }
 
 /**
@@ -49,62 +43,21 @@ function makeCacheKey(mode: RenderMode, source: string): string {
     return 'ggb_' + Math.abs(hash).toString(36);
 }
 
-/** 根据缓存键生成文件路径 */
-function cachePath(key: string): string {
-    return `${cacheDirPath}/${key}.html`;
+/** 从内存缓存读取 */
+function cacheGet(key: string): string | null {
+    const val = memoryCache.get(key) ?? null;
+    if (val) {
+        console.log(`[GeoGebra] Cache HIT ${key} (${(val.length / 1024).toFixed(0)}KB)`);
+    } else {
+        console.log(`[GeoGebra] Cache MISS ${key} (total entries: ${memoryCache.size})`);
+    }
+    return val;
 }
 
-/**
- * 从缓存中读取内容。
- * 优先尝试文件缓存（持久化），失败则回退到 localStorage。
- */
-async function cacheGet(key: string): Promise<string | null> {
-    // 优先尝试文件缓存
-    if (cacheVault) {
-        try {
-            const path = cachePath(key);
-            const file = cacheVault.getFileByPath(path);
-            if (file) return await cacheVault.read(file);
-        } catch { /* 文件不存在或读取失败，忽略 */ }
-    }
-    // 回退到 localStorage（在 PDF 导出上下文中也能工作）
-    try { return localStorage.getItem('ggb_' + key); } catch { return null; }
-}
-
-/**
- * 将内容写入缓存。
- * 同时写入文件缓存和 localStorage，确保双重备份。
- */
-async function cacheSet(key: string, value: string): Promise<void> {
-    // 写入文件缓存
-    if (cacheVault) {
-        try {
-            const path = cachePath(key);
-            // 确保目录存在
-            const dir = path.substring(0, path.lastIndexOf('/'));
-            if (!cacheVault.getAbstractFileByPath(dir)) {
-                try { await cacheVault.createFolder(dir); } catch { /* 目录已存在 */ }
-            }
-            try {
-                const existing = cacheVault.getFileByPath(path);
-                if (existing) {
-                    await cacheVault.modify(existing, value);
-                } else {
-                    await cacheVault.create(path, value);
-                }
-            } catch {
-                // 竞态条件：在检查和创建之间文件可能被其他代码块创建，尝试修改
-                try {
-                    const f = cacheVault.getFileByPath(path);
-                    if (f) await cacheVault.modify(f, value);
-                } catch { /* 忽略 */ }
-            }
-        } catch (e) {
-            console.warn('[GeoGebra] File cache write failed:', e);
-        }
-    }
-    // 同时写入 localStorage 作为回退
-    try { localStorage.setItem('ggb_' + key, value); } catch { /* 忽略 */ }
+/** 写入内存缓存 */
+function cacheSet(key: string, value: string): void {
+    memoryCache.set(key, value);
+    console.log(`[GeoGebra] Cache SET ${key} (${(value.length / 1024).toFixed(0)}KB, total: ${memoryCache.size})`);
 }
 
 // ─── GeoGebra 引擎配置 ──────────────────────────────────────
@@ -308,12 +261,15 @@ export async function renderGeoGebra(
     // PDF 导出时 Obsidian 会重新渲染 markdown 但不等 GeoGebra 加载完成，
     // 此时缓存的 PNG 图片可以立即显示在导出容器中。
     let hasCachedContent = false;
-    const cached = await cacheGet(ck);
+    console.log(`[GeoGebra] Block ${ck}: checking cache (isConnected=${container.isConnected}, source=${source.trim().substring(0, 40)}...)`);
+    const cached = cacheGet(ck);
     if (cached) {
         exportDiv.innerHTML = cached;
         exportDiv.classList.add('ggb-export-active'); // 激活导出容器显示
         hasCachedContent = true;
-        console.log(`[GeoGebra] Cache hit: ${ck} (${cached.length} chars)`);
+        console.log(`[GeoGebra] Block ${ck}: cache loaded (${(cached.length / 1024).toFixed(0)}KB), exportDiv children: ${exportDiv.children.length}`);
+    } else {
+        console.log(`[GeoGebra] Block ${ck}: NO cache found`);
     }
 
     // 生成唯一 applet ID（时间戳 + 计数器）
@@ -337,6 +293,35 @@ export async function renderGeoGebra(
     // 解析用户参数和 GeoGebra 命令
     const { params: userParams, commands } = parseSource(source);
     console.log(`[GeoGebra] Rendering ${mode} applet (${APP_NAMES[mode]}) with ${commands.length} commands, params:`, userParams);
+
+    // ── 步骤 2.5：检测 PDF 导出上下文 ──
+    // PDF 导出时 Obsidian 在分离的 DOM 中渲染 markdown，元素永远不会出现在
+    // document 中。此时 GGBApplet.inject() 无法工作（依赖 getElementById）。
+    // 检测方法：container.isConnected 为 false 表示不在 document DOM 树中。
+    if (!container.isConnected) {
+        await new Promise(r => setTimeout(r, 50));
+    }
+    if (!container.isConnected) {
+        console.log(`[GeoGebra] ★ PDF Export path for ${ck}: hasCachedContent=${hasCachedContent}, exportDiv.children=${exportDiv.children.length}, exportDiv.innerHTML.length=${exportDiv.innerHTML.length}`);
+        if (hasCachedContent) {
+            console.log(`[GeoGebra] ★ Detached DOM (PDF export): using cached content for ${ck} (${(exportDiv.innerHTML.length / 1024).toFixed(0)}KB)`);
+            appletDiv.style.display = 'none';
+            loadingEl.remove();
+            container.classList.add('ggb-cache-only');
+            exportDiv.style.display = 'block';
+            return;
+        } else {
+            console.warn(`[GeoGebra] ★ Detached DOM (PDF export): NO CACHE for ${ck}, block will be empty!`);
+            console.warn(`[GeoGebra] ★ Memory cache keys: [${Array.from(memoryCache.keys()).join(', ')}]`);
+            appletDiv.style.display = 'none';
+            loadingEl.remove();
+            container.createDiv({
+                cls: 'geogebra-error',
+                text: 'GeoGebra: no cached image available for PDF export. View the note first to generate cache.',
+            });
+            return;
+        }
+    }
 
     // ── 步骤 3：错误捕获 ──
     // 监听 GeoGebra 初始化过程中的未捕获错误（来自 web3d、geogebra 脚本）
@@ -481,12 +466,33 @@ export async function renderGeoGebra(
 
         // ── 步骤 6：创建 applet 并等待加载 ──
 
+        // 注入 GWT meta 标签，让 web3d.nocache.js 能直接找到 CDN baseUrl。
+        // 背景：我们的 CSP 绕过把 script.src 替换为 blob URL，导致 GWT 搜索
+        // <script src="...web3d.nocache.js"> 失败。通过 meta 标签提前告知 baseUrl，
+        // GWT 优先读取 meta 而不搜索 script 标签。
+        const ver = getGeoGebraVersion();
+        let metaTag: HTMLMetaElement | null = null;
+        if (ver) {
+            metaTag = document.createElement('meta');
+            metaTag.setAttribute('name', 'gwt:property');
+            metaTag.setAttribute('content', `baseUrl=https://www.geogebra.org/apps/${ver}/web3d/`);
+            document.head.appendChild(metaTag);
+            console.log(`[GeoGebra] Injected GWT baseUrl meta tag (v${ver})`);
+        }
+
         await new Promise<void>((resolve, reject) => {
+            // 防止 appletOnLoad 和轮询回退重复触发初始化逻辑
+            let callbackFired = false;
+            // 轮询定时器：当 appletOnLoad 回调未触发时，通过检测 window 全局 API 来补救
+            let pollTimer: ReturnType<typeof setInterval> | null = null;
+
             // 有缓存时超时更短（15s），因为缓存已经可以用于 PDF 导出
-            // 无缓存时给 60s 等待 CDN 加载
-            const timeoutMs = hasCachedContent ? 15000 : 60000;
+            // 无缓存时给 90s 等待 CDN 加载（.cache.js 约 7.7MB）
+            const timeoutMs = hasCachedContent ? 15000 : 90000;
             const timeout = setTimeout(() => {
+                if (pollTimer) clearInterval(pollTimer);
                 window.removeEventListener('error', errorHandler);
+                if (metaTag && metaTag.parentNode) metaTag.parentNode.removeChild(metaTag);
                 if (hasCachedContent) {
                     // 有缓存 → 静默放弃实时 applet，使用缓存的 PNG
                     console.log(`[GeoGebra] Live applet timed out but cache available, using cached content`);
@@ -501,7 +507,7 @@ export async function renderGeoGebra(
                     // 无缓存 → 报错
                     const errMsg = errorCapture.length > 0
                         ? `GeoGebra errors:\n${errorCapture.join('\n')}`
-                        : 'GeoGebra applet initialization timed out (60s). Check console for details.';
+                        : `GeoGebra applet initialization timed out (${timeoutMs / 1000}s). Check console for details.`;
                     reject(new Error(errMsg));
                 }
             }, timeoutMs);
@@ -547,10 +553,15 @@ export async function renderGeoGebra(
                 preventFocus: true,              // 防止自动获取焦点
 
                 // ── applet 加载完成回调 ──
-                // GeoGebra SDK 在 applet 完全初始化后调用此函数
+                // GeoGebra SDK 在 applet 完全初始化后调用此函数。
+                // 也可能由下方的轮询回退机制手动调用（当 SDK 回调未触发时）。
                 appletOnLoad: (api: any) => {
+                    if (callbackFired) return; // 已由回调或轮询处理，防止重复执行
+                    callbackFired = true;
+                    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
                     clearTimeout(timeout);
                     window.removeEventListener('error', errorHandler);
+                    if (metaTag && metaTag.parentNode) metaTag.parentNode.removeChild(metaTag);
                     console.log(`[GeoGebra] Applet ${appletId} ready, executing ${commands.length} commands...`);
                     loadingEl.remove();
 
@@ -602,6 +613,8 @@ export async function renderGeoGebra(
                     if (mode !== RenderMode.Geometry3D) {
                         addIntersectionPoints(api);
                     }
+
+                    // 函数控制面板在 debouncedRefresh 定义之后创建（见下方）
 
                     // 3D 模式下默认线条较粗，自动调细（除非用户已通过 SetLineThickness 自定义）
                     if (mode === RenderMode.Geometry3D) {
@@ -921,35 +934,70 @@ export async function renderGeoGebra(
                         `<img src="data:image/png;base64,${b64}" class="ggb-export-img" style="width:${visualWidth}px;max-width:100%;height:auto;" alt="GeoGebra ${mode}">`;
 
                     /**
-                     * 截取当前 applet 的 PNG 快照并注入到导出容器中。
-                     * 优先使用 getPNGBase64（同步、高质量），失败则回退到 getScreenshotBase64（异步）。
+                     * 截取当前 applet 的 PNG/SVG 快照并注入到导出容器中。
+                     * 按优先级尝试多种方式：getPNGBase64 → exportSVG → getScreenshotBase64。
+                     *
+                     * @param label 调试标签，标识这是第几次尝试
                      */
-                    const injectPNGFallback = () => {
+                    const injectPNGFallback = (label: string) => {
                         // 方案 1：同步 PNG 导出（2x 缩放，144 DPI）
                         try {
                             const b64 = api.getPNGBase64(2, false, 144);
                             if (b64 && b64.length > 100) {
                                 exportDiv.innerHTML = mkImg(b64);
                                 saveExportToCache();
-                                console.log(`[GeoGebra] PNG export cached (visual ${visualWidth}px)`);
+                                console.log(`[GeoGebra] PNG cached [${label}] (${(b64.length / 1024).toFixed(0)}KB, visual ${visualWidth}px)`);
                                 return;
                             }
-                        } catch { /* 忽略 */ }
-                        // 方案 2：异步截图回退
+                            console.log(`[GeoGebra] PNG empty [${label}]: getPNGBase64 returned ${b64?.length || 0} chars`);
+                        } catch (e) {
+                            console.log(`[GeoGebra] PNG failed [${label}]: getPNGBase64 error:`, e);
+                        }
+
+                        // 方案 2：SVG 导出（对 Locus、曲线等矢量图形更可靠）
+                        try {
+                            api.exportSVG((svgStr: string) => {
+                                if (svgStr && svgStr.length > 100) {
+                                    const svgB64 = btoa(unescape(encodeURIComponent(svgStr)));
+                                    const imgTag = `<img src="data:image/svg+xml;base64,${svgB64}" class="ggb-export-img" style="width:${visualWidth}px;max-width:100%;height:auto;" alt="GeoGebra ${mode}">`;
+                                    exportDiv.innerHTML = imgTag;
+                                    saveExportToCache();
+                                    console.log(`[GeoGebra] SVG cached [${label}] (${(svgStr.length / 1024).toFixed(0)}KB)`);
+                                    return;
+                                }
+                                console.log(`[GeoGebra] SVG empty [${label}]: ${svgStr?.length || 0} chars`);
+                            });
+                        } catch (e) {
+                            console.log(`[GeoGebra] SVG failed [${label}]:`, e);
+                        }
+
+                        // 方案 3：异步截图回退
                         try {
                             api.getScreenshotBase64((b64: string) => {
                                 if (b64 && b64.length > 100) {
                                     exportDiv.innerHTML = mkImg(b64);
                                     saveExportToCache();
-                                    console.log(`[GeoGebra] Screenshot export cached`);
+                                    console.log(`[GeoGebra] Screenshot cached [${label}] (${(b64.length / 1024).toFixed(0)}KB)`);
+                                } else {
+                                    console.log(`[GeoGebra] Screenshot empty [${label}]: ${b64?.length || 0} chars`);
                                 }
                             });
-                        } catch { /* 忽略 */ }
+                        } catch (e) {
+                            console.log(`[GeoGebra] Screenshot failed [${label}]:`, e);
+                        }
                     };
 
-                    // 在视图调整稳定后截取快照（两次，确保质量）
-                    setTimeout(injectPNGFallback, saveDelay + 1000);
-                    setTimeout(injectPNGFallback, saveDelay + 4000);
+                    // 多轮 PNG 快照捕获（递增延迟），确保 Locus 等计算密集型构造完成渲染。
+                    // 每次成功都会覆盖前一次的缓存，最终缓存的是渲染最完整的版本。
+                    const pngDelays = [
+                        saveDelay + 1000,   // ~1.8s: 快速首次捕获
+                        saveDelay + 4000,   // ~4.8s: 标准延迟
+                        saveDelay + 8000,   // ~8.8s: 复杂构造（Locus、大量交点等）
+                        saveDelay + 15000,  // ~15.8s: 超重构造最终兜底
+                    ];
+                    for (let i = 0; i < pngDelays.length; i++) {
+                        setTimeout(() => injectPNGFallback(`attempt ${i + 1}/${pngDelays.length}`), pngDelays[i]);
+                    }
 
                     // ── 交互监听：用户操作后自动更新 PNG 快照 ──
 
@@ -957,7 +1005,7 @@ export async function renderGeoGebra(
                     /** 防抖刷新：600ms 内多次触发只执行一次 */
                     const debouncedRefresh = () => {
                         if (refreshTimer) clearTimeout(refreshTimer);
-                        refreshTimer = setTimeout(injectPNGFallback, 600);
+                        refreshTimer = setTimeout(() => injectPNGFallback('interaction'), 600);
                     };
 
                     try {
@@ -976,6 +1024,11 @@ export async function renderGeoGebra(
                         });
                     } catch { /* 忽略 */ }
 
+                    // ── 函数控制面板 ──
+                    // 在图形容器左上角显示浮动面板，列出所有函数/曲线对象，
+                    // 点击可切换显示/隐藏；切换后触发 PNG 快照刷新以保证 PDF 导出一致。
+                    createFunctionPanel(api, container, debouncedRefresh);
+
                     resolve();
                 },
             };
@@ -986,20 +1039,58 @@ export async function renderGeoGebra(
                 const applet = new GGBApplet(params, true); // true = HTML5 only
 
                 // 设置 GeoGebra CDN codebase（确保资源从正确版本加载）
-                const ver = getGeoGebraVersion();
                 if (ver) {
                     const codebase = `https://www.geogebra.org/apps/${ver}/web3d/`;
                     console.log(`[GeoGebra] Setting codebase: ${codebase}`);
                     applet.setHTML5Codebase(codebase);
                 }
 
+                // 临时 patch document.getElementById 确保 GGBApplet.inject() 能找到元素。
+                // GGBApplet 内部通过 getElementById(id) 查找目标容器，但在 Obsidian
+                // 的虚拟滚动或延迟挂载场景下，getElementById 可能找不到我们创建的元素。
+                const origGetElementById = document.getElementById.bind(document);
+                const patchedGetById = function (id: string): HTMLElement | null {
+                    if (id === appletId) return appletDiv;
+                    return origGetElementById(id);
+                };
+                document.getElementById = patchedGetById as typeof document.getElementById;
+
                 // 注入到 DOM，GeoGebra 将异步加载并最终触发 appletOnLoad 回调
                 console.log(`[GeoGebra] Injecting into #${appletId}...`);
                 applet.inject(appletId);
                 console.log(`[GeoGebra] inject() called, waiting for appletOnLoad callback...`);
+
+                // 恢复原始 getElementById（延迟恢复，inject 内部可能异步调用）
+                setTimeout(() => {
+                    if (document.getElementById === patchedGetById) {
+                        document.getElementById = origGetElementById;
+                    }
+                }, 2000);
+
+                // ── 轮询回退：检测 GeoGebra API 可用性 ──
+                // GeoGebra 通过 Blob URL 加载脚本时，GWT 内部的 appletOnLoad 回调链
+                // 可能断裂（执行上下文变化），导致回调永远不触发。
+                // 但 GeoGebra 仍会将 API 注册为 window[appletId]。
+                // 每 2 秒检查一次，发现 API 可用后手动触发初始化逻辑。
+                pollTimer = setInterval(() => {
+                    if (callbackFired) {
+                        clearInterval(pollTimer!);
+                        pollTimer = null;
+                        return;
+                    }
+                    const api = (window as any)[appletId];
+                    if (api && typeof api.evalCommand === 'function') {
+                        console.log(`[GeoGebra] API detected via polling for ${appletId}, triggering manual init`);
+                        clearInterval(pollTimer!);
+                        pollTimer = null;
+                        params.appletOnLoad(api);
+                    }
+                }, 2000);
             } catch (e) {
+                if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
                 clearTimeout(timeout);
                 window.removeEventListener('error', errorHandler);
+                if (metaTag && metaTag.parentNode) metaTag.parentNode.removeChild(metaTag);
                 reject(e);
             }
         });
@@ -1222,6 +1313,176 @@ function executeCommands(api: any, commands: string[]): void {
  *
  * 命令格式：varName = Slider(min, max, step)
  */
+/**
+ * 创建函数图像控制面板。
+ *
+ * 在 GeoGebra 图形右上角放置一个图标按钮，默认收起。
+ * 点击图标展开面板，列出所有函数/曲线对象，每个可点击切换显示/隐藏。
+ * 面板内提供"全部显示"和"全部隐藏"快捷按钮。
+ * 再次点击图标或点击面板外区域收起面板。
+ *
+ * @param api       GeoGebra API 对象
+ * @param container 外层 DOM 容器
+ */
+function createFunctionPanel(api: any, container: HTMLElement, onVisibilityChange?: () => void): void {
+    try {
+        const allNames: string[] = api.getAllObjectNames() || [];
+        const funcEntries: { name: string; expr: string; color: string }[] = [];
+
+        for (const name of allNames) {
+            const objType = (api.getObjectType(name) || '').toLowerCase();
+            if (objType !== 'function' && objType !== 'curve' && objType !== 'conic'
+                && objType !== 'line' && objType !== 'implicit') continue;
+
+            let expr = '';
+            try {
+                expr = api.getDefinitionString(name) || api.getValueString(name) || name;
+            } catch { expr = name; }
+
+            let color = '#4285f4';
+            try {
+                const r = api.getColor(name);
+                if (r) color = r;
+            } catch { /* 忽略 */ }
+
+            funcEntries.push({ name, expr, color });
+        }
+
+        if (funcEntries.length === 0) return;
+
+        // ── 外层包装：图标 + 面板 ──
+        const wrapper = document.createElement('div');
+        wrapper.className = 'ggb-func-wrapper';
+
+        // 触发按钮（默认可见的小图标）
+        const toggleBtn = document.createElement('button');
+        toggleBtn.className = 'ggb-func-toggle-btn';
+        toggleBtn.title = 'Toggle function list';
+        toggleBtn.innerHTML = '<span class="ggb-func-toggle-icon">𝑓</span>';
+        wrapper.appendChild(toggleBtn);
+
+        // 面板容器（默认隐藏）
+        const panel = document.createElement('div');
+        panel.className = 'ggb-func-panel';
+
+        // ── 工具栏：全部显示 / 全部隐藏 ──
+        const toolbar = document.createElement('div');
+        toolbar.className = 'ggb-func-toolbar';
+
+        const showAllBtn = document.createElement('button');
+        showAllBtn.className = 'ggb-func-action-btn';
+        showAllBtn.textContent = 'Show All';
+
+        const hideAllBtn = document.createElement('button');
+        hideAllBtn.className = 'ggb-func-action-btn';
+        hideAllBtn.textContent = 'Hide All';
+
+        toolbar.appendChild(showAllBtn);
+        toolbar.appendChild(hideAllBtn);
+        panel.appendChild(toolbar);
+
+        // ── 函数列表 ──
+        interface RowState { name: string; visible: boolean; row: HTMLElement; dot: HTMLElement; eye: HTMLElement }
+        const rows: RowState[] = [];
+
+        for (const entry of funcEntries) {
+            let visible = true;
+            try { visible = api.getVisible(entry.name); } catch { /* 默认可见 */ }
+
+            const row = document.createElement('div');
+            row.className = 'ggb-func-row';
+            if (!visible) row.classList.add('ggb-func-hidden');
+
+            const dot = document.createElement('span');
+            dot.className = 'ggb-func-dot';
+            dot.style.backgroundColor = entry.color;
+            if (!visible) dot.style.opacity = '0.3';
+
+            const label = document.createElement('span');
+            label.className = 'ggb-func-label';
+            label.textContent = entry.expr;
+            label.title = entry.expr;
+
+            const eye = document.createElement('span');
+            eye.className = 'ggb-func-eye';
+            eye.textContent = visible ? '👁' : '—';
+
+            const state: RowState = { name: entry.name, visible, row, dot, eye };
+            rows.push(state);
+
+            row.addEventListener('click', () => {
+                state.visible = !state.visible;
+                api.setVisible(state.name, state.visible);
+                eye.textContent = state.visible ? '👁' : '—';
+                row.classList.toggle('ggb-func-hidden', !state.visible);
+                dot.style.opacity = state.visible ? '1' : '0.3';
+                if (onVisibilityChange) onVisibilityChange();
+            });
+
+            row.appendChild(dot);
+            row.appendChild(label);
+            row.appendChild(eye);
+            panel.appendChild(row);
+        }
+
+        // 更新所有行的 UI 状态
+        const syncAllUI = () => {
+            for (const s of rows) {
+                s.eye.textContent = s.visible ? '👁' : '—';
+                s.row.classList.toggle('ggb-func-hidden', !s.visible);
+                s.dot.style.opacity = s.visible ? '1' : '0.3';
+            }
+        };
+
+        showAllBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            for (const s of rows) {
+                s.visible = true;
+                api.setVisible(s.name, true);
+            }
+            syncAllUI();
+            if (onVisibilityChange) onVisibilityChange();
+        });
+
+        hideAllBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            for (const s of rows) {
+                s.visible = false;
+                api.setVisible(s.name, false);
+            }
+            syncAllUI();
+            if (onVisibilityChange) onVisibilityChange();
+        });
+
+        wrapper.appendChild(panel);
+
+        // ── 展开/收起逻辑 ──
+        let expanded = false;
+        const setExpanded = (val: boolean) => {
+            expanded = val;
+            panel.classList.toggle('ggb-func-panel-open', expanded);
+            toggleBtn.classList.toggle('ggb-func-toggle-active', expanded);
+        };
+
+        toggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setExpanded(!expanded);
+        });
+
+        // 点击面板外区域收起
+        document.addEventListener('click', (e) => {
+            if (expanded && !wrapper.contains(e.target as Node)) {
+                setExpanded(false);
+            }
+        });
+
+        container.appendChild(wrapper);
+        console.log(`[GeoGebra] Created function panel with ${funcEntries.length} entries`);
+    } catch (e) {
+        console.warn('[GeoGebra] Error creating function panel:', e);
+    }
+}
+
 function createSliderOverlay(api: any, commands: string[], container: HTMLElement): void {
     // 解析 Slider 命令：name = Slider(min, max, step)
     const sliderRegex = /^(\w+)\s*=\s*Slider\s*\(\s*([\d.eE+-]+)\s*,\s*([\d.eE+-]+)\s*(?:,\s*([\d.eE+-]+))?\s*\)/i;
