@@ -24,11 +24,76 @@ declare const GGBApplet: any;
 /** PNG 快照缓存：key → HTML img 标签（含 base64 数据） */
 const memoryCache = new Map<string, string>();
 
+// ─── 磁盘缓存（持久化，重启后可恢复） ─────────────────────────
+let vaultAdapter: { read: (p: string) => Promise<string>; write: (p: string, d: string) => Promise<void>; exists: (p: string) => Promise<boolean>; mkdir: (p: string) => Promise<void>; list: (p: string) => Promise<{ files: string[]; folders: string[] }> } | null = null;
+let cacheDirPath = '';
+
 /**
- * 设置缓存目录。保留接口兼容性（main.ts 调用），但不再使用文件缓存。
+ * 设置缓存目录。存储 vault adapter 引用，供磁盘读写使用。
  */
-export function setCacheDir(_vault: any, _dir: string): void {
-    // no-op: 仅使用内存缓存
+export function setCacheDir(vault: any, dir: string): void {
+    vaultAdapter = vault?.adapter ?? null;
+    cacheDirPath = dir || '';
+}
+
+/**
+ * 启动时从磁盘预加载所有缓存条目到内存。
+ * 必须在代码块处理器注册前调用，确保 PDF 导出能命中缓存。
+ */
+export async function preloadDiskCache(): Promise<void> {
+    if (!vaultAdapter || !cacheDirPath) return;
+    try {
+        if (!(await vaultAdapter.exists(cacheDirPath))) return;
+        const listing = await vaultAdapter.list(cacheDirPath);
+        const files: string[] = listing?.files ?? [];
+        let loaded = 0;
+        for (const filePath of files) {
+            if (!filePath.endsWith('.html')) continue;
+            const segments = filePath.split('/');
+            const key = segments[segments.length - 1].replace('.html', '');
+            if (memoryCache.has(key)) continue;
+            try {
+                const content = await vaultAdapter.read(filePath);
+                if (content && content.length > 100) {
+                    memoryCache.set(key, content);
+                    loaded++;
+                }
+            } catch { /* ignore individual file errors */ }
+        }
+        console.log(`[GeoGebra] Preloaded ${loaded} cache entries from disk (total: ${memoryCache.size})`);
+    } catch (e) {
+        console.warn('[GeoGebra] Failed to preload disk cache:', e);
+    }
+}
+
+async function writeCacheToDisk(key: string, value: string): Promise<void> {
+    if (!vaultAdapter || !cacheDirPath) return;
+    try {
+        if (!(await vaultAdapter.exists(cacheDirPath))) {
+            await vaultAdapter.mkdir(cacheDirPath);
+        }
+        await vaultAdapter.write(`${cacheDirPath}/${key}.html`, value);
+    } catch (e) {
+        console.warn(`[GeoGebra] Disk cache write failed for ${key}:`, e);
+    }
+}
+
+async function cacheGetFromDisk(key: string): Promise<string | null> {
+    if (!vaultAdapter || !cacheDirPath) return null;
+    try {
+        const filePath = `${cacheDirPath}/${key}.html`;
+        if (await vaultAdapter.exists(filePath)) {
+            const content = await vaultAdapter.read(filePath);
+            if (content && content.length > 100) {
+                memoryCache.set(key, content);
+                console.log(`[GeoGebra] Disk cache HIT ${key} (${(content.length / 1024).toFixed(0)}KB)`);
+                return content;
+            }
+        }
+    } catch (e) {
+        console.warn(`[GeoGebra] Disk cache read failed for ${key}:`, e);
+    }
+    return null;
 }
 
 /**
@@ -55,10 +120,11 @@ function cacheGet(key: string): string | null {
     return val;
 }
 
-/** 写入内存缓存 */
+/** 写入内存缓存并异步持久化到磁盘 */
 function cacheSet(key: string, value: string): void {
     memoryCache.set(key, value);
     console.log(`[GeoGebra] Cache SET ${key} (${(value.length / 1024).toFixed(0)}KB, total: ${memoryCache.size})`);
+    writeCacheToDisk(key, value);
 }
 
 // ─── GeoGebra 引擎配置 ──────────────────────────────────────
@@ -263,7 +329,7 @@ export async function renderGeoGebra(
     // 此时缓存的 PNG 图片可以立即显示在导出容器中。
     let hasCachedContent = false;
     console.log(`[GeoGebra] Block ${ck}: checking cache (isConnected=${container.isConnected}, source=${source.trim().substring(0, 40)}...)`);
-    const cached = cacheGet(ck);
+    const cached = cacheGet(ck) || await cacheGetFromDisk(ck);
     if (cached) {
         exportDiv.innerHTML = cached;
         exportDiv.classList.add('ggb-export-active'); // 激活导出容器显示
@@ -303,6 +369,23 @@ export async function renderGeoGebra(
         await new Promise(r => setTimeout(r, 50));
     }
     if (!container.isConnected) {
+        // 如果内存没有缓存，可能是并行的 live 渲染正在生成 PNG。
+        // 轮询等待最多 ~20s（10 次 × 2s），给 live 渲染足够时间完成 PNG 捕获。
+        if (!hasCachedContent) {
+            console.log(`[GeoGebra] ★ PDF export: no cache for ${ck}, waiting for live rendering...`);
+            for (let retry = 0; retry < 10; retry++) {
+                await new Promise(r => setTimeout(r, 2000));
+                const retryCache = cacheGet(ck) || await cacheGetFromDisk(ck);
+                if (retryCache) {
+                    exportDiv.innerHTML = retryCache;
+                    exportDiv.classList.add('ggb-export-active');
+                    hasCachedContent = true;
+                    console.log(`[GeoGebra] ★ PDF export: cache appeared for ${ck} after ${(retry + 1) * 2}s wait`);
+                    break;
+                }
+            }
+        }
+
         console.log(`[GeoGebra] ★ PDF Export path for ${ck}: hasCachedContent=${hasCachedContent}, exportDiv.children=${exportDiv.children.length}, exportDiv.innerHTML.length=${exportDiv.innerHTML.length}`);
         if (hasCachedContent) {
             console.log(`[GeoGebra] ★ Detached DOM (PDF export): using cached content for ${ck} (${(exportDiv.innerHTML.length / 1024).toFixed(0)}KB)`);

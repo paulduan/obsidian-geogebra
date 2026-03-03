@@ -8,7 +8,7 @@
  */
 import { Plugin, MarkdownPostProcessorContext, PluginSettingTab, App, Setting } from 'obsidian';
 import { RenderMode, LANGUAGE_MODE_MAP } from './types';
-import { renderGeoGebra, setCacheDir } from './geogebra-renderer';
+import { renderGeoGebra, setCacheDir, preloadDiskCache } from './geogebra-renderer';
 import { installInterceptor, removeInterceptor } from './geogebra-loader';
 
 /** 插件设置接口 */
@@ -41,6 +41,7 @@ export default class GeoGebraPlugin extends Plugin {
 
         // 设置 vault 引用和缓存目录，供渲染器写入 PNG 快照
         setCacheDir(this.app.vault, this.settings.cacheDir);
+        await preloadDiskCache();
 
         // 添加设置面板
         this.addSettingTab(new GeoGebraSettingTab(this.app, this));
@@ -49,8 +50,8 @@ export default class GeoGebraPlugin extends Plugin {
         for (const [lang, mode] of Object.entries(LANGUAGE_MODE_MAP)) {
             this.registerMarkdownCodeBlockProcessor(
                 lang,
-                (source: string, el: HTMLElement, _ctx: MarkdownPostProcessorContext) => {
-                    this.processBlock(source, el, mode);
+                async (source: string, el: HTMLElement, _ctx: MarkdownPostProcessorContext) => {
+                    await this.processBlock(source, el, mode);
                 }
             );
         }
@@ -62,7 +63,7 @@ export default class GeoGebraPlugin extends Plugin {
      * 2. 创建浮动工具栏（包含重置按钮，鼠标悬停时显示）
      * 3. 调用 renderGeoGebra 渲染交互式 applet
      */
-    private processBlock(source: string, el: HTMLElement, mode: RenderMode): void {
+    private async processBlock(source: string, el: HTMLElement, mode: RenderMode): Promise<void> {
         // 外层容器，附带模式 CSS 类以便样式区分
         const container = el.createDiv({ cls: `geogebra-container geogebra-mode-${mode}` });
 
@@ -77,7 +78,7 @@ export default class GeoGebraPlugin extends Plugin {
         resetBtn.innerHTML = '<span class="ggb-btn-icon">↺</span> Reset';
 
         // 渲染 GeoGebra applet，传入回调以在 applet 就绪后启用重置按钮
-        renderGeoGebra(container, source, mode, {
+        await renderGeoGebra(container, source, mode, {
             onResetReady: (resetFn) => {
                 // applet 初始状态已保存，启用重置按钮
                 resetBtn.removeAttribute('disabled');
