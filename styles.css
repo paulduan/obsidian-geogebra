@@ -427,6 +427,60 @@
     display: none !important;
 }
 
+/* ─── Interactive overlay (cache-first mode) ─── */
+
+.ggb-interact-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 5;
+    border-radius: 4px;
+    transition: background-color 0.2s;
+}
+
+.ggb-interact-overlay:hover {
+    background: rgba(0, 0, 0, 0.25);
+}
+
+.ggb-interact-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 20px;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    border-radius: 8px;
+    color: #fff;
+    font-size: 0.85em;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+}
+
+.ggb-interact-overlay:hover .ggb-interact-label {
+    opacity: 1;
+}
+
+.ggb-interact-icon {
+    font-size: 1.2em;
+}
+
+@media print {
+    .ggb-interact-overlay {
+        display: none !important;
+    }
+}
+
+.geogebra-container.ggb-cache-only .ggb-interact-overlay {
+    display: none !important;
+}
+
 /* ─── Error display ─── */
 
 .geogebra-error {

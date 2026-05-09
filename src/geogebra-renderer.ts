@@ -315,64 +315,25 @@ export async function renderGeoGebra(
     mode: RenderMode,
     callbacks?: AppletCallbacks
 ): Promise<void> {
-    const { onResetReady } = callbacks || {};
     const ck = makeCacheKey(mode, source);
+    const { params: userParams, commands } = parseSource(source);
 
-    // ── 步骤 1：创建 DOM 结构 ──
-
-    // 导出容器：用于存放 PDF 导出的静态 PNG 图片。
-    // 屏幕上默认隐藏（display: none），仅在 @media print 和缓存回退时显示。
     const exportDiv = container.createDiv({ cls: 'ggb-export-container' });
 
-    // ── 步骤 2：检查缓存 ──
-    // PDF 导出时 Obsidian 会重新渲染 markdown 但不等 GeoGebra 加载完成，
-    // 此时缓存的 PNG 图片可以立即显示在导出容器中。
     let hasCachedContent = false;
-    console.log(`[GeoGebra] Block ${ck}: checking cache (isConnected=${container.isConnected}, source=${source.trim().substring(0, 40)}...)`);
     const cached = cacheGet(ck) || await cacheGetFromDisk(ck);
     if (cached) {
         exportDiv.innerHTML = cached;
-        exportDiv.classList.add('ggb-export-active'); // 激活导出容器显示
+        exportDiv.classList.add('ggb-export-active');
         hasCachedContent = true;
-        console.log(`[GeoGebra] Block ${ck}: cache loaded (${(cached.length / 1024).toFixed(0)}KB), exportDiv children: ${exportDiv.children.length}`);
-    } else {
-        console.log(`[GeoGebra] Block ${ck}: NO cache found`);
     }
 
-    // 生成唯一 applet ID（时间戳 + 计数器）
-    const appletId = `ggb-applet-${Date.now()}-${++appletCounter}`;
-    // applet 容器：GeoGebra 将在此 div 内渲染交互式图形
-    // 注意：不要修改 appletDiv 的 class，scaleContainerClass 依赖 'ggb-applet-container'
-    const appletDiv = container.createDiv({ cls: 'ggb-applet-container' });
-    appletDiv.id = appletId;
-    // 3D 模式标记加到外层 container 上，用于 CSS 限定 transform-origin 规则
-    if (mode === RenderMode.Geometry3D) {
-        container.classList.add('ggb-3d');
-    }
-
-    // 加载提示：如果有缓存内容则隐藏（避免 PDF 导出时显示 "Loading..."）
-    const loadingEl = container.createDiv({ cls: 'ggb-loading' });
-    loadingEl.setText('Loading GeoGebra...');
-    if (hasCachedContent) {
-        loadingEl.style.display = 'none';
-    }
-
-    // 解析用户参数和 GeoGebra 命令
-    const { params: userParams, commands } = parseSource(source);
-    console.log(`[GeoGebra] Rendering ${mode} applet (${APP_NAMES[mode]}) with ${commands.length} commands, params:`, userParams);
-
-    // ── 步骤 2.5：检测 PDF 导出上下文 ──
-    // PDF 导出时 Obsidian 在分离的 DOM 中渲染 markdown，元素永远不会出现在
-    // document 中。此时 GGBApplet.inject() 无法工作（依赖 getElementById）。
-    // 检测方法：container.isConnected 为 false 表示不在 document DOM 树中。
+    // PDF 导出检测：分离 DOM 中无法注入 applet
     if (!container.isConnected) {
         await new Promise(r => setTimeout(r, 50));
     }
     if (!container.isConnected) {
-        // 如果内存没有缓存，可能是并行的 live 渲染正在生成 PNG。
-        // 轮询等待最多 ~20s（10 次 × 2s），给 live 渲染足够时间完成 PNG 捕获。
         if (!hasCachedContent) {
-            console.log(`[GeoGebra] ★ PDF export: no cache for ${ck}, waiting for live rendering...`);
             for (let retry = 0; retry < 10; retry++) {
                 await new Promise(r => setTimeout(r, 2000));
                 const retryCache = cacheGet(ck) || await cacheGetFromDisk(ck);
@@ -380,34 +341,70 @@ export async function renderGeoGebra(
                     exportDiv.innerHTML = retryCache;
                     exportDiv.classList.add('ggb-export-active');
                     hasCachedContent = true;
-                    console.log(`[GeoGebra] ★ PDF export: cache appeared for ${ck} after ${(retry + 1) * 2}s wait`);
                     break;
                 }
             }
         }
-
-        console.log(`[GeoGebra] ★ PDF Export path for ${ck}: hasCachedContent=${hasCachedContent}, exportDiv.children=${exportDiv.children.length}, exportDiv.innerHTML.length=${exportDiv.innerHTML.length}`);
         if (hasCachedContent) {
-            console.log(`[GeoGebra] ★ Detached DOM (PDF export): using cached content for ${ck} (${(exportDiv.innerHTML.length / 1024).toFixed(0)}KB)`);
-            appletDiv.style.display = 'none';
-            loadingEl.remove();
             container.classList.add('ggb-cache-only');
             exportDiv.style.display = 'block';
-            return;
         } else {
-            console.warn(`[GeoGebra] ★ Detached DOM (PDF export): NO CACHE for ${ck}, block will be empty!`);
-            console.warn(`[GeoGebra] ★ Memory cache keys: [${Array.from(memoryCache.keys()).join(', ')}]`);
-            appletDiv.style.display = 'none';
-            loadingEl.remove();
             container.createDiv({
                 cls: 'geogebra-error',
                 text: 'GeoGebra: no cached image available for PDF export. View the note first to generate cache.',
             });
-            return;
         }
+        return;
     }
 
-    // ── 步骤 3：错误捕获 ──
+    // 缓存优先模式：有缓存时显示静态图片，用户点击后才加载交互 applet
+    if (hasCachedContent) {
+        const overlay = container.createDiv({ cls: 'ggb-interact-overlay' });
+        const label = overlay.createDiv({ cls: 'ggb-interact-label' });
+        label.innerHTML = '<span class="ggb-interact-icon">▶</span> Click to interact';
+        overlay.addEventListener('click', async () => {
+            overlay.remove();
+            await loadAndActivateApplet(container, exportDiv, mode, ck, userParams, commands, true, callbacks);
+        });
+        return;
+    }
+
+    // 无缓存：直接加载 applet
+    await loadAndActivateApplet(container, exportDiv, mode, ck, userParams, commands, false, callbacks);
+}
+
+/**
+ * 加载 GeoGebra SDK 并注入交互式 applet。
+ * 从 renderGeoGebra 的缓存优先路径（用户点击）或首次加载路径调用。
+ */
+async function loadAndActivateApplet(
+    container: HTMLElement,
+    exportDiv: HTMLElement,
+    mode: RenderMode,
+    ck: string,
+    userParams: AppletParams,
+    commands: string[],
+    hasCachedContent: boolean,
+    callbacks?: AppletCallbacks,
+): Promise<void> {
+    const { onResetReady } = callbacks || {};
+
+    const appletId = `ggb-applet-${Date.now()}-${++appletCounter}`;
+    const appletDiv = container.createDiv({ cls: 'ggb-applet-container' });
+    appletDiv.id = appletId;
+    if (mode === RenderMode.Geometry3D) {
+        container.classList.add('ggb-3d');
+    }
+
+    const loadingEl = container.createDiv({ cls: 'ggb-loading' });
+    loadingEl.setText('Loading GeoGebra...');
+    if (hasCachedContent) {
+        loadingEl.style.display = 'none';
+    }
+
+    console.log(`[GeoGebra] Activating ${mode} applet (${APP_NAMES[mode]}) with ${commands.length} commands, params:`, userParams);
+
+    // ── 错误捕获 ──
     // 监听 GeoGebra 初始化过程中的未捕获错误（来自 web3d、geogebra 脚本）
     const errorCapture: string[] = [];
     const errorHandler = (event: ErrorEvent) => {
@@ -1116,6 +1113,40 @@ export async function renderGeoGebra(
                     // 在图形容器左上角显示浮动面板，列出所有函数/曲线对象，
                     // 点击可切换显示/隐藏；切换后触发 PNG 快照刷新以保证 PDF 导出一致。
                     createFunctionPanel(api, container, debouncedRefresh);
+
+                    // ── 离屏自动清理 ──
+                    // applet 滚出视口 10 秒后自动销毁，恢复缓存图片 + 交互覆盖层
+                    let offscreenTimer: ReturnType<typeof setTimeout> | null = null;
+                    const visObserver = new IntersectionObserver((entries) => {
+                        for (const entry of entries) {
+                            if (!entry.isIntersecting) {
+                                offscreenTimer = setTimeout(() => {
+                                    try { injectPNGFallback('offscreen-cleanup'); } catch { /* 忽略 */ }
+                                    setTimeout(() => {
+                                        appletDiv.remove();
+                                        loadingEl?.remove();
+                                        container.querySelectorAll('.ggb-slider-overlay, .ggb-func-wrapper').forEach(el => el.remove());
+                                        exportDiv.classList.add('ggb-export-active');
+                                        const overlay = container.createDiv({ cls: 'ggb-interact-overlay' });
+                                        const label = overlay.createDiv({ cls: 'ggb-interact-label' });
+                                        label.innerHTML = '<span class="ggb-interact-icon">▶</span> Click to interact';
+                                        overlay.addEventListener('click', async () => {
+                                            overlay.remove();
+                                            await loadAndActivateApplet(container, exportDiv, mode, ck, userParams, commands, true, callbacks);
+                                        });
+                                        visObserver.disconnect();
+                                        console.log(`[GeoGebra] Applet destroyed (off-screen cleanup)`);
+                                    }, 500);
+                                }, 10000);
+                            } else {
+                                if (offscreenTimer) {
+                                    clearTimeout(offscreenTimer);
+                                    offscreenTimer = null;
+                                }
+                            }
+                        }
+                    }, { threshold: 0 });
+                    visObserver.observe(container);
 
                     resolve();
                 },
